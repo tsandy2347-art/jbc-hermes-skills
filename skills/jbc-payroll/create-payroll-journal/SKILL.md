@@ -1,22 +1,22 @@
 ---
 name: create-payroll-journal
-description: Build two balanced manual journals (one in SC Xero with Wide Bay tracking-tagged lines, one in CQ Xero) from a MYOB Pay Activity Summary's per-entity totals. Posts both as DRAFT — Nicole / Tony / the external accountant clicks Post in Xero. The agent never posts.
-version: 0.1.0
+description: Build JBC payroll DRAFT manual journals from a MYOB Pay Activity Summary, split by (Entity × Direct/Indirect). Mirrors the shape Craig used historically — real JBC codes (477/477.4/478/478.1/803/825/826/877), Location tracking on SC's P&L lines (Sunshine Coast / Wide Bay), 877 Tracking Transfers clearing so payables stay untagged. Hard-locked DRAFT — Nicole / Tony / external accountant posts in Xero.
+version: 0.3.0
 platforms: [linux, macos]
 metadata:
   hermes:
-    tags: [xero, payroll, jbc, drafts, manual-journal, finance, sc, cq, wb]
+    tags: [xero, payroll, jbc, drafts, manual-journal, finance, sc, cq, wb, location-tracking]
     category: jbc-finance
 required_environment_variables:
   - name: XERO_SC_CLIENT_ID
-    prompt: Xero SC tenant client ID (Sunshine Coast Pty Ltd — also holds Wide Bay as a Location tracking option)
-    required_for: SC + WB journal
+    prompt: Xero SC tenant client ID (Sunshine Coast Pty Ltd — also holds Wide Bay)
+    required_for: SC journal (SC + WB lines, Location-tracked)
   - name: XERO_SC_CLIENT_SECRET
     prompt: Xero SC tenant client secret
-    required_for: SC + WB journal
+    required_for: SC journal
   - name: XERO_SC_TENANT_ID
     prompt: Xero SC tenant UUID
-    required_for: SC + WB journal
+    required_for: SC journal
   - name: XERO_CQ_CLIENT_ID
     prompt: Xero CQ tenant client ID (Central Queensland Pty Ltd)
     required_for: CQ journal
@@ -28,105 +28,87 @@ required_environment_variables:
     required_for: CQ journal
 ---
 
-# Create payroll DRAFT manual journals from MYOB Pay Activity totals
+# Create JBC payroll DRAFT manual journals
 
 ## When to use
 
-Triggered when the user has a MYOB Advanced "Pay Activity [Summary]" report
-for a single pay period and wants the corresponding journal entries posted
-in Xero. JBC's payroll spans three operational entities — Sunshine Coast,
-Wide Bay, and Central Queenland — across two Xero tenants:
+Triggered when the user has MYOB Pay Activity Summary totals for a pay
+period and wants the corresponding manual journals in Xero. JBC's
+operational shape:
 
 - **SC Xero tenant** holds Sunshine Coast + Wide Bay. WB is tagged via the
-  `Location` tracking category (options "Sunshine Coast" and "Wide Bay").
-- **CQ Xero tenant** holds Central Queenland only.
+  Xero `Location` tracking category (options `Sunshine Coast` and `Wide Bay`).
+- **CQ Xero tenant** is its own Pty Ltd. Single location.
 
-One DRAFT manual journal goes into each Xero tenant per pay period.
+One DRAFT manual journal per Xero tenant per pay period.
+
+## The JBC chart (real codes, per Craig's historical journals)
+
+| Line | Code | Side | Tracked? |
+|------|------|------|----------|
+| Wages and Salaries — Direct | `477` | DR | Location (SC tenant only) |
+| Wages — Indirect | `477.4` | DR | Location (SC tenant only) |
+| Superannuation — Direct | `478` | DR | Location (SC tenant only) |
+| Superannuation — Indirect | `478.1` | DR | Location (SC tenant only) |
+| Wages Payable | `803` | CR | NO tracking |
+| PAYG Withholdings Payable | `825` | CR | NO tracking |
+| Superannuation Payable | `826` | CR | NO tracking |
+| Tracking Transfers (clearing) | `877` | both | mixed — see below |
+
+Direct vs Indirect rule (Tony 2026-05-27): **Department `Field` = Direct.
+Everything else = Indirect.** (Admin / Mgmt / Finance / HR / Rostering /
+HCP / HCP Admin / NDIS Disability / NDIS SIL → Indirect.)
+
+## The Tracking Transfers (877) pattern — important
+
+JBC's pattern (from Journal #673782 by Craig):
+- Expense DRs (477 / 477.4 / 478 / 478.1) carry the `Location` tag.
+- Payable CRs (803 / 825 / 826) carry NO tag — they're shared clearing accounts.
+- `877 Tracking Transfers` bridges the two:
+  - `CR 877 (with location)` matches each expense DR by location + amount → location nets to zero on P&L
+  - `DR 877 (no location)` matches each payable CR amount → balance-sheet payables reconcile clean
+
+The skill collapses Craig's line-by-line `877` entries into one per (location × directness × account) for readability — same accounting effect, cleaner journal. If you want the line-by-line MYOB-block breakdown, ask and I'll iterate.
+
+## CQ doesn't use Location tracking
+
+CQ's journal is single-tenant single-location — no `877` clearing needed.
+Just DR expenses + CR payables, untagged. If CQ ever adds tracking dims,
+tell me and I'll layer them in.
 
 ## Hard rules
 
-1. **Status is hard-locked to DRAFT** in the Python below. No path flips
-   it to POSTED. Nicole / Tony / external accountant posts in Xero.
-2. **One journal per Xero tenant.** SC's journal contains BOTH Sunshine
-   Coast and Wide Bay lines, distinguished by the Location tracking on
-   each line. CQ's journal contains only CQ lines.
-3. **Each journal must balance** (total DR = total CR within 1c).
-4. **Pre-tax deductions and Salary-Sacrifice Super are the same dollar.**
-   In MYOB's report `PreTaxDed` equals `EmpSuper` (employee elected to
-   reduce pre-tax pay to fund super). Don't double-count.
-
-## MYOB column → journal mapping
-
-For each entity (SC / WB / CQ) the journal expands as:
-
-```
-DR  Wages & Salaries Expense         = Gross
-DR  Allowances Expense (after-tax)   = AfterTax
-DR  Superannuation Expense (SG)      = EmployerSuper
-                                       ───────────
-                                     = Gross + AfterTax + EmployerSuper
-
-CR  PAYG Withholding Payable         = PAYG
-CR  Post-tax Deductions Payable      = PostTaxDed
-CR  Net Pay / Bank Clearing          = Net
-CR  Salary Sacrifice Super Payable   = PreTaxDed   (≡ EmpSuper)
-CR  Superannuation Payable (SG)      = EmployerSuper
-                                       ───────────
-                                       (balances)
-```
-
-Net is computed by MYOB as: `Net = Gross − PreTaxDed − PAYG + AfterTax − PostTaxDed`.
-Confirmed against Tony's 20-24 Apr file (every entity balanced to the cent).
+1. **Status is hard-locked to DRAFT** in the Python below. No path flips it.
+2. **One journal per Xero tenant** — SC's contains SC + WB (Location-tagged), CQ's is CQ-only.
+3. **Each journal balances** (DR == CR within 1c).
+4. **Net = Gross − PreTaxDed − PAYG + AfterTax − PostTaxDed** (verified against MYOB row-8 totals).
+5. **AfterTax allowances roll into the wages line** (no separate allowances account in JBC's chart).
+6. **PreTaxDed (salary sacrifice) is the same dollar as part of EmpSuper** — counted once, on the Wages Payable CR (it reduces what hits the employee's bank).
 
 ## Procedure
 
-1. Get per-entity totals from the user. Either:
-   - User pastes them (e.g. "SC: gross 181684.35, payg 38370…"), OR
-   - User provides path to a parsed JSON, OR
-   - User asks Mark to extract them from a MYOB Pay Activity file (Mark
-     does that conversationally, then hands the totals back to the skill).
+1. Confirm with the user, conversationally:
+   - **Pay period start, end, and journal date** (usually period end)
+   - **Per-(entity × directness) totals** — six tuples max:
+     `SC / Direct`, `SC / Indirect`, `WB / Direct`, `WB / Indirect`,
+     `CQ / Direct`, `CQ / Indirect`. Set unused tuples to `None`.
+   - **Account codes** — defaults below match Craig's example. User can
+     override per-line if needed.
 
-2. Confirm:
-   - **Pay period** (date range and the journal-date — usually the last
-     day of the period)
-   - **Account codes** for each line type (Wages, Allowances, SuperExpense,
-     PAYG Payable, PostTaxDed Payable, Net Pay clearing, SalarySacrifice
-     Super Payable, Super Payable). Defaults below; user can override.
+2. Render the proposal: two balanced blocks (SC tenant with SC+WB
+   Location-tagged DRs + CRs + 877 clearing, then CQ tenant). Show
+   DR/CR sums per tenant.
+   End with: **"Reply YES to confirm and I'll create both DRAFTS in Xero now."**
 
-3. Render the proposal: two balanced journal blocks (SC with WB-tagged
-   lines, then CQ). Show DR/CR sums. End with:
-   **"Reply YES to confirm and I'll create both DRAFTS in Xero now."**
+3. ON EXPLICIT YES — invoke the Python via `execute_code` with `PARAMS`
+   populated.
 
-4. ON EXPLICIT YES — invoke the Python via `execute_code` with `PARAMS`
-   populated from the user's confirmed proposal.
+4. Quote both Xero deep-links back; add "Nicole / Tony / external
+   accountant clicks Post in Xero when ready."
 
-5. The script:
-   - Discovers SC's Location tracking category + options
-     (Sunshine Coast / Wide Bay UUIDs) via `/TrackingCategories`.
-   - Builds SC journal lines for SC and WB, each line carrying the
-     correct `Tracking` dimension.
-   - Builds CQ journal lines (no tracking).
-   - POSTs both as DRAFT manual journals.
-   - Returns both deep-links.
-
-6. Quote both Xero links back to the user; add the standard
-   "Nicole / Tony / the external accountant clicks Post" close.
-
-## Default account codes (placeholders — user overrides)
-
-| Line | Default code |
-|------|------|
-| Wages & Salaries Expense | `6010` |
-| Allowances Expense | `6011` |
-| Superannuation Expense (SG) | `6020` |
-| PAYG Withholding Payable | `2100` |
-| Post-tax Deductions Payable | `2105` |
-| Net Pay / Bank Clearing | `2110` |
-| Salary Sacrifice Super Payable | `2130` |
-| Superannuation Payable (SG) | `2140` |
-
-If Xero rejects a code, relay the error verbatim and ask the user to
-correct.
+5. On Xero error, relay verbatim and ask the user how to proceed
+   (usually: an account code that doesn't exist, or a Location option
+   that's spelled differently in Xero).
 
 ## The script (run via execute_code on YES)
 
@@ -135,38 +117,35 @@ import base64, datetime as _dt, json, os, sys
 import urllib.error, urllib.request
 
 # ─── PARAMS — populate from the user's confirmed proposal ────────────
+# Defaults below are Tony's 20-24 April 2026 pay-week (Payrun1908+1909+1911-ish)
+# split by Department: Field = Direct, all others = Indirect.
 PARAMS = {
     "pay_period_start": "2026-04-20",
     "pay_period_end":   "2026-04-24",
-    "journal_date":     "2026-04-24",  # usually the period end
+    "journal_date":     "2026-04-24",
     "narration":        "Payroll week ending 24 Apr 2026",
-    # Per-entity totals (from the MYOB Pay Activity [Summary] report).
-    # Set unused entities to None to skip them.
+    # Per (entity, directness) totals from MYOB Pay Activity Summary.
+    # Each block: gross, pretax_ded, payg, after_tax, post_tax_ded, net, employer_super.
+    # Set a tuple to None to skip it.
     "totals": {
-        "SC": {"gross": 181684.35, "pretax_ded": 550.00, "payg": 38370.00,
-               "after_tax": 9406.14, "post_tax_ded": 409.45,
-               "net": 151761.04, "employer_super": 21802.13},
-        "WB": {"gross": 21319.33, "pretax_ded": 0.00, "payg": 4493.00,
-               "after_tax": 1256.69, "post_tax_ded": 0.00,
-               "net": 18083.02, "employer_super": 2558.33},
-        "CQ": {"gross": 53161.67, "pretax_ded": 0.00, "payg": 9913.00,
-               "after_tax": 2468.82, "post_tax_ded": 0.00,
-               "net": 45717.49, "employer_super": 6379.41},
+        "SC_DIRECT":   {"gross": 107151.63, "pretax_ded": 150.00, "payg": 21438.00, "after_tax": 9406.14, "post_tax_ded": 409.45, "net": 94560.32, "employer_super": 12858.20},
+        "SC_INDIRECT": {"gross": 74532.72,  "pretax_ded": 400.00, "payg": 16932.00, "after_tax": 0.00,    "post_tax_ded": 0.00,   "net": 57200.72, "employer_super": 8943.93},
+        "WB_DIRECT":   {"gross": 20069.33,  "pretax_ded": 0.00,   "payg": 4269.00,  "after_tax": 1256.69, "post_tax_ded": 0.00,   "net": 17057.02, "employer_super": 2408.33},
+        "WB_INDIRECT": {"gross": 1250.00,   "pretax_ded": 0.00,   "payg": 224.00,   "after_tax": 0.00,    "post_tax_ded": 0.00,   "net": 1026.00,  "employer_super": 150.00},
+        "CQ_DIRECT":   {"gross": 37285.46,  "pretax_ded": 0.00,   "payg": 6765.00,  "after_tax": 2468.82, "post_tax_ded": 0.00,   "net": 32989.28, "employer_super": 4474.26},
+        "CQ_INDIRECT": {"gross": 15876.21,  "pretax_ded": 0.00,   "payg": 3148.00,  "after_tax": 0.00,    "post_tax_ded": 0.00,   "net": 12728.21, "employer_super": 1905.15},
     },
-    # Account codes the user confirmed. Defaults match the skill table.
     "codes": {
-        "wages":              "6010",
-        "allowances":         "6011",
-        "super_expense":      "6020",
-        "payg_payable":       "2100",
-        "post_tax_payable":   "2105",
-        "net_pay_clearing":   "2110",
-        "salary_sac_payable": "2130",
-        "super_payable":      "2140",
+        "wages_direct":   "477",
+        "wages_indirect": "477.4",
+        "super_direct":   "478",
+        "super_indirect": "478.1",
+        "wages_payable":  "803",
+        "payg_payable":   "825",
+        "super_payable":  "826",
+        "tracking_xfer":  "877",
     },
-    # SC Xero's Location tracking category name + the option names that
-    # correspond to "Sunshine Coast" and "Wide Bay". Defaults match what
-    # Tony confirmed; tweak if Xero spells them differently.
+    # SC Xero's Location tracking category name + option names.
     "sc_tracking": {
         "category_name": "Location",
         "sc_option_name": "Sunshine Coast",
@@ -214,7 +193,6 @@ def _xero_get(creds, token, path):
         headers={"Authorization": f"Bearer {token}",
                  "Xero-Tenant-Id": creds["tenant_id"],
                  "Accept": "application/json"},
-        method="GET",
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -223,105 +201,165 @@ def _xero_get(creds, token, path):
         raise RuntimeError(f"Xero GET {path} failed: {e.code} {e.read().decode()[:300]}") from e
 
 
-def discover_sc_location_tracking(creds, token, cfg):
-    """Return {sc_option_id, wb_option_id, category_id} for SC's Location dim."""
+def discover_location_tracking(creds, token, cfg):
     data = _xero_get(creds, token, "/TrackingCategories")
     cats = data.get("TrackingCategories", [])
-    target = None
-    for c in cats:
-        if c.get("Name", "").strip().lower() == cfg["category_name"].strip().lower() and c.get("Status") == "ACTIVE":
-            target = c
-            break
+    target = next((c for c in cats
+                   if c.get("Name", "").strip().lower() == cfg["category_name"].strip().lower()
+                   and c.get("Status") == "ACTIVE"), None)
     if not target:
-        raise RuntimeError(
-            f"Couldn't find ACTIVE tracking category named '{cfg['category_name']}' on SC Xero — "
-            f"saw: {[c.get('Name') for c in cats]}"
-        )
-    options = target.get("Options", [])
-    by_name = {o.get("Name", "").strip().lower(): o for o in options if o.get("Status") == "ACTIVE"}
-    sc_opt = by_name.get(cfg["sc_option_name"].strip().lower())
-    wb_opt = by_name.get(cfg["wb_option_name"].strip().lower())
-    if not sc_opt:
-        raise RuntimeError(
-            f"'{cfg['sc_option_name']}' not found in '{cfg['category_name']}' options on SC Xero — "
-            f"saw: {[o.get('Name') for o in options]}"
-        )
-    if not wb_opt:
-        raise RuntimeError(
-            f"'{cfg['wb_option_name']}' not found in '{cfg['category_name']}' options on SC Xero — "
-            f"saw: {[o.get('Name') for o in options]}"
-        )
+        raise RuntimeError(f"Couldn't find ACTIVE tracking category '{cfg['category_name']}' on SC Xero — saw: {[c.get('Name') for c in cats]}")
+    by_name = {o.get("Name", "").strip().lower(): o for o in target.get("Options", []) if o.get("Status") == "ACTIVE"}
+    sc = by_name.get(cfg["sc_option_name"].strip().lower())
+    wb = by_name.get(cfg["wb_option_name"].strip().lower())
+    if not sc:
+        raise RuntimeError(f"'{cfg['sc_option_name']}' not in '{cfg['category_name']}' options — saw: {[o.get('Name') for o in target.get('Options', [])]}")
+    if not wb:
+        raise RuntimeError(f"'{cfg['wb_option_name']}' not in '{cfg['category_name']}' options — saw: {[o.get('Name') for o in target.get('Options', [])]}")
     return {
         "category_id": target["TrackingCategoryID"],
         "category_name": target["Name"],
-        "sc_option_id": sc_opt["TrackingOptionID"],
-        "wb_option_id": wb_opt["TrackingOptionID"],
-        "sc_option_name": sc_opt["Name"],
-        "wb_option_name": wb_opt["Name"],
+        "sc_option_id": sc["TrackingOptionID"],
+        "wb_option_id": wb["TrackingOptionID"],
     }
 
 
-def journal_lines_for(entity_label, totals, codes, tracking=None):
-    """Build the 8-or-fewer JournalLines for one entity.
-       LineAmount sign in Xero: positive = DR, negative = CR."""
+def _round(n):
+    return round(float(n or 0), 2)
+
+
+def build_sc_journal_lines(totals, codes, tracking):
+    """SC + WB lines for the SC tenant, with Location tracking + 877 clearing.
+       Layout per (location × directness):
+         DR  Wages    (Gross + AfterTax)    Location-tagged
+         DR  Super    (EmployerSuper)        Location-tagged
+         CR  877       (DR sum)              Location-tagged   ← clears the location side
+       Then ONE block of untracked payables:
+         CR  803 Wages Payable     (sum of Nets across SC+WB)
+         CR  825 PAYG Payable      (sum of PAYGs across SC+WB)
+         CR  826 Super Payable     (sum of EmployerSuper across SC+WB)
+       Plus matching DR 877 untracked = sum of payable CRs.
+       Total DR = Total CR by construction."""
     lines = []
 
-    def add(side, code, amount, desc):
-        if amount is None:
-            return
-        amount = round(float(amount), 2)
-        if abs(amount) < 0.005:  # skip zero lines
-            return
-        line = {
-            "LineAmount": amount if side == "DR" else -amount,
-            "AccountCode": str(code),
-            "Description": f"{entity_label} — {desc}",
-        }
-        if tracking:
-            line["Tracking"] = [tracking]
-        lines.append(line)
+    def loc_dim(tag):
+        return [{"TrackingCategoryID": tracking["category_id"],
+                 "TrackingOptionID":   tracking["sc_option_id"] if tag == "SC" else tracking["wb_option_id"]}]
 
-    g = totals.get("gross")        or 0
-    a = totals.get("after_tax")    or 0
-    s = totals.get("employer_super") or 0
-    p = totals.get("payg")          or 0
-    ptd = totals.get("post_tax_ded") or 0
-    n = totals.get("net")           or 0
-    sac = totals.get("pretax_ded")  or 0  # salary-sacrifice super (≡ EmpSuper)
+    location_blocks = [
+        ("SC", "Direct",   "SC_DIRECT",   codes["wages_direct"],   codes["super_direct"]),
+        ("SC", "Indirect", "SC_INDIRECT", codes["wages_indirect"], codes["super_indirect"]),
+        ("WB", "Direct",   "WB_DIRECT",   codes["wages_direct"],   codes["super_direct"]),
+        ("WB", "Indirect", "WB_INDIRECT", codes["wages_indirect"], codes["super_indirect"]),
+    ]
 
-    # DRs
-    add("DR", codes["wages"],         g,   "Wages & Salaries (gross)")
-    add("DR", codes["allowances"],    a,   "Allowances (after-tax)")
-    add("DR", codes["super_expense"], s,   "Superannuation Expense (SG)")
-    # CRs
-    add("CR", codes["payg_payable"],       p,   "PAYG Withholding Payable")
-    add("CR", codes["post_tax_payable"],   ptd, "Post-tax Deductions Payable")
-    add("CR", codes["net_pay_clearing"],   n,   "Net Pay / Bank Clearing")
-    add("CR", codes["salary_sac_payable"], sac, "Salary Sacrifice Super Payable")
-    add("CR", codes["super_payable"],      s,   "Superannuation Payable (SG)")
+    payables_acc = {"net": 0.0, "payg": 0.0, "super": 0.0}
 
-    dr = sum(l["LineAmount"] for l in lines if l["LineAmount"] > 0)
-    cr = -sum(l["LineAmount"] for l in lines if l["LineAmount"] < 0)
-    if abs(dr - cr) > 0.01:
-        raise RuntimeError(
-            f"{entity_label} unbalanced — DR {dr:.2f} != CR {cr:.2f}. "
-            f"Likely Net != Gross − PreTax − PAYG + AfterTax − PostTax. "
-            f"Check totals before retrying."
-        )
+    for loc, kind, key, wages_acc, super_acc in location_blocks:
+        t = totals.get(key)
+        if not t:
+            continue
+        gross_plus_at = _round(t.get("gross", 0) + t.get("after_tax", 0))
+        super_emp = _round(t.get("employer_super", 0))
+        loc_total = _round(gross_plus_at + super_emp)
+        if abs(loc_total) < 0.005:
+            continue
+
+        if gross_plus_at:
+            lines.append({"LineAmount": gross_plus_at, "AccountCode": wages_acc,
+                          "Description": f"{loc} / {kind} — Wages (gross + after-tax allowances)",
+                          "Tracking": loc_dim(loc)})
+        if super_emp:
+            lines.append({"LineAmount": super_emp, "AccountCode": super_acc,
+                          "Description": f"{loc} / {kind} — Superannuation expense (SG)",
+                          "Tracking": loc_dim(loc)})
+        # 877 CR with location — clears the location side
+        lines.append({"LineAmount": -loc_total, "AccountCode": codes["tracking_xfer"],
+                      "Description": f"{loc} / {kind} — Tracking Transfer (location clearing)",
+                      "Tracking": loc_dim(loc)})
+
+        payables_acc["net"]   += t.get("net", 0)
+        payables_acc["payg"]  += t.get("payg", 0)
+        payables_acc["super"] += t.get("employer_super", 0)
+
+    # Untracked payable CRs (combined across all SC + WB blocks)
+    net_total   = _round(payables_acc["net"])
+    payg_total  = _round(payables_acc["payg"])
+    super_total = _round(payables_acc["super"])
+    untracked_cr = _round(net_total + payg_total + super_total)
+    if net_total:
+        lines.append({"LineAmount": -net_total, "AccountCode": codes["wages_payable"],
+                      "Description": "Net pay (SC + WB combined) — Wages Payable"})
+    if payg_total:
+        lines.append({"LineAmount": -payg_total, "AccountCode": codes["payg_payable"],
+                      "Description": "PAYG withholdings (SC + WB combined)"})
+    if super_total:
+        lines.append({"LineAmount": -super_total, "AccountCode": codes["super_payable"],
+                      "Description": "Employer super (SC + WB combined)"})
+
+    # Matching untracked 877 DR
+    if untracked_cr:
+        lines.append({"LineAmount": untracked_cr, "AccountCode": codes["tracking_xfer"],
+                      "Description": "Tracking Transfer — payable clearing (no location)"})
+    return lines
+
+
+def build_cq_journal_lines(totals, codes):
+    """CQ Xero: no location tracking. Standard DR expenses / CR payables shape."""
+    lines = []
+    blocks = [
+        ("Direct",   "CQ_DIRECT",   codes["wages_direct"],   codes["super_direct"]),
+        ("Indirect", "CQ_INDIRECT", codes["wages_indirect"], codes["super_indirect"]),
+    ]
+    pay = {"net": 0.0, "payg": 0.0, "super": 0.0}
+    for kind, key, wages_acc, super_acc in blocks:
+        t = totals.get(key)
+        if not t:
+            continue
+        gross_plus_at = _round(t.get("gross", 0) + t.get("after_tax", 0))
+        super_emp = _round(t.get("employer_super", 0))
+        if gross_plus_at:
+            lines.append({"LineAmount": gross_plus_at, "AccountCode": wages_acc,
+                          "Description": f"CQ / {kind} — Wages (gross + after-tax allowances)"})
+        if super_emp:
+            lines.append({"LineAmount": super_emp, "AccountCode": super_acc,
+                          "Description": f"CQ / {kind} — Superannuation expense (SG)"})
+        pay["net"]   += t.get("net", 0)
+        pay["payg"]  += t.get("payg", 0)
+        pay["super"] += t.get("employer_super", 0)
+
+    net = _round(pay["net"]); payg = _round(pay["payg"]); sg = _round(pay["super"])
+    if net:
+        lines.append({"LineAmount": -net,  "AccountCode": codes["wages_payable"],
+                      "Description": "Net pay (CQ) — Wages Payable"})
+    if payg:
+        lines.append({"LineAmount": -payg, "AccountCode": codes["payg_payable"],
+                      "Description": "PAYG withholdings (CQ)"})
+    if sg:
+        lines.append({"LineAmount": -sg,   "AccountCode": codes["super_payable"],
+                      "Description": "Employer super (CQ)"})
     return lines
 
 
 def post_draft_journal(entity_xero, narration, journal_date, lines):
+    if not lines:
+        return None
     creds = _creds(entity_xero)
     if not creds["tenant_id"]:
         raise RuntimeError(f"XERO_{entity_xero}_TENANT_ID not set")
+
+    dr = sum(l["LineAmount"] for l in lines if l["LineAmount"] > 0)
+    cr = -sum(l["LineAmount"] for l in lines if l["LineAmount"] < 0)
+    if abs(dr - cr) > 0.01:
+        raise RuntimeError(f"{entity_xero} journal unbalanced: DR {dr:.2f} != CR {cr:.2f}")
+
     token = _token(creds)
 
     brisbane_now = _dt.datetime.now(_dt.timezone.utc).astimezone(
         _dt.timezone(_dt.timedelta(hours=10))
     )
-    tag = f"[DRAFT auto-generated by JBC Hermes {brisbane_now:%Y-%m-%d %H:%M AEST}]"
-    final_narration = f"{narration} {tag}"[:2500]
+    tag = f" [DRAFT auto-generated by JBC Hermes {brisbane_now:%Y-%m-%d %H:%M AEST}]"
+    final_narration = (narration + tag)[:2500]
 
     body = {
         "Date": journal_date,
@@ -352,60 +390,40 @@ def post_draft_journal(entity_xero, narration, journal_date, lines):
         raise RuntimeError(f"Xero {e.code}: {msg}") from e
 
     mj = data["ManualJournals"][0]
-    mj_id = mj["ManualJournalID"]
     return {
-        "ok": True,
-        "tenant": entity_xero,
-        "ManualJournalID": mj_id,
+        "ok": True, "tenant": entity_xero,
+        "ManualJournalID": mj["ManualJournalID"],
         "Status": mj.get("Status"),
-        "Total DR": sum(l["LineAmount"] for l in lines if l["LineAmount"] > 0),
-        "Total CR": -sum(l["LineAmount"] for l in lines if l["LineAmount"] < 0),
-        "xero_link": f"https://go.xero.com/Bank/ViewManualJournal.aspx?ManualJournalID={mj_id}",
+        "TotalDR": round(dr, 2),
+        "TotalCR": round(cr, 2),
+        "LineCount": len(lines),
+        "xero_link": f"https://go.xero.com/Bank/ViewManualJournal.aspx?ManualJournalID={mj['ManualJournalID']}",
     }
 
 
 def run(p):
-    out = {"sc_xero": None, "cq_xero": None, "warnings": []}
+    out = {"sc_xero": None, "cq_xero": None, "notes": []}
 
-    # SC + WB share the SC Xero tenant via Location tracking.
-    sc_t = p["totals"].get("SC")
-    wb_t = p["totals"].get("WB")
-    if sc_t or wb_t:
+    has_sc_side = any(p["totals"].get(k) for k in ("SC_DIRECT", "SC_INDIRECT", "WB_DIRECT", "WB_INDIRECT"))
+    if has_sc_side:
         creds_sc = _creds("SC")
         if not creds_sc["client_id"]:
             raise RuntimeError("XERO_SC_* env vars not set — can't post SC/WB journal")
         token_sc = _token(creds_sc)
-        tracking_dims = discover_sc_location_tracking(creds_sc, token_sc, p["sc_tracking"])
-        out["warnings"].append(
-            f"SC tracking dims: {tracking_dims['category_name']} → "
-            f"{tracking_dims['sc_option_name']} ({tracking_dims['sc_option_id'][:8]}…), "
-            f"{tracking_dims['wb_option_name']} ({tracking_dims['wb_option_id'][:8]}…)"
-        )
+        tracking = discover_location_tracking(creds_sc, token_sc, p["sc_tracking"])
+        out["notes"].append(f"SC Location: {tracking['sc_option_id'][:8]}…  WB Location: {tracking['wb_option_id'][:8]}…")
+        sc_lines = build_sc_journal_lines(p["totals"], p["codes"], tracking)
+        sc_narration = f"{p['narration']} — SC + Wide Bay (pay period {p['pay_period_start']} to {p['pay_period_end']})"
+        out["sc_xero"] = post_draft_journal("SC", sc_narration, p["journal_date"], sc_lines)
 
-        sc_lines = []
-        if sc_t:
-            sc_lines += journal_lines_for(
-                "Sunshine Coast", sc_t, p["codes"],
-                tracking={"TrackingCategoryID": tracking_dims["category_id"],
-                          "TrackingOptionID":   tracking_dims["sc_option_id"]},
-            )
-        if wb_t:
-            sc_lines += journal_lines_for(
-                "Wide Bay", wb_t, p["codes"],
-                tracking={"TrackingCategoryID": tracking_dims["category_id"],
-                          "TrackingOptionID":   tracking_dims["wb_option_id"]},
-            )
-        narration = f"{p['narration']} — Sunshine Coast + Wide Bay (pay period {p['pay_period_start']} to {p['pay_period_end']})"
-        out["sc_xero"] = post_draft_journal("SC", narration, p["journal_date"], sc_lines)
-
-    cq_t = p["totals"].get("CQ")
-    if cq_t:
+    has_cq_side = any(p["totals"].get(k) for k in ("CQ_DIRECT", "CQ_INDIRECT"))
+    if has_cq_side:
         creds_cq = _creds("CQ")
         if not creds_cq["client_id"]:
             raise RuntimeError("XERO_CQ_* env vars not set — can't post CQ journal")
-        cq_lines = journal_lines_for("Central Queensland", cq_t, p["codes"], tracking=None)
-        narration = f"{p['narration']} — Central Queensland (pay period {p['pay_period_start']} to {p['pay_period_end']})"
-        out["cq_xero"] = post_draft_journal("CQ", narration, p["journal_date"], cq_lines)
+        cq_lines = build_cq_journal_lines(p["totals"], p["codes"])
+        cq_narration = f"{p['narration']} — Central Queensland (pay period {p['pay_period_start']} to {p['pay_period_end']})"
+        out["cq_xero"] = post_draft_journal("CQ", cq_narration, p["journal_date"], cq_lines)
 
     out["ok"] = True
     return out
@@ -418,29 +436,49 @@ except Exception as exc:
     sys.exit(1)
 ```
 
-## Example (week ending 24 Apr 2026)
+## What the user sees in the proposal (example — April week)
 
-User: "Create the payroll journals for week 20-24 April using the per-entity
-totals I just gave you."
-
-You confirm:
-
-> **SC Xero — Sunshine Coast lines (Location: Sunshine Coast)**
-> DR 6010 Wages $181,684.35 · DR 6011 Allowances $9,406.14 · DR 6020 Super-Exp $21,802.13
-> CR 2100 PAYG $38,370 · CR 2105 PostTax $409.45 · CR 2110 Net Pay $151,761.04 · CR 2130 SalSac $550 · CR 2140 Super-Pay $21,802.13
-> **Sunshine Coast subtotal: $212,892.62 DR / $212,892.62 CR ✓**
->
-> **SC Xero — Wide Bay lines (Location: Wide Bay)**
-> DR 6010 Wages $21,319.33 · DR 6011 Allowances $1,256.69 · DR 6020 Super-Exp $2,558.33
-> CR 2100 PAYG $4,493 · CR 2110 Net Pay $18,083.02 · CR 2140 Super-Pay $2,558.33
-> **Wide Bay subtotal: $25,134.35 DR / $25,134.35 CR ✓**
->
-> **CQ Xero**
-> DR 6010 Wages $53,161.67 · DR 6011 Allowances $2,468.82 · DR 6020 Super-Exp $6,379.41
-> CR 2100 PAYG $9,913 · CR 2110 Net Pay $45,717.49 · CR 2140 Super-Pay $6,379.41
-> **CQ subtotal: $62,009.90 DR / $62,009.90 CR ✓**
->
-> Account codes are placeholders — adjust if your chart uses different codes.
+> **SC Xero journal — Payroll wk ending 24 Apr 2026 — SC + Wide Bay**
+> 
+> Sunshine Coast / Direct:
+>   DR 477 Wages-Direct (Loc: Sunshine Coast) — $116,557.77
+>   DR 478 Super-Direct (Loc: Sunshine Coast) — $12,858.20
+>   CR 877 Tracking Transfer (Loc: Sunshine Coast) — $129,415.97
+> 
+> Sunshine Coast / Indirect:
+>   DR 477.4 Wages-Indirect (Loc: Sunshine Coast) — $74,532.72
+>   DR 478.1 Super-Indirect (Loc: Sunshine Coast) — $8,943.93
+>   CR 877 Tracking Transfer (Loc: Sunshine Coast) — $83,476.65
+> 
+> Wide Bay / Direct:
+>   DR 477 Wages-Direct (Loc: Wide Bay) — $21,326.02
+>   DR 478 Super-Direct (Loc: Wide Bay) — $2,408.33
+>   CR 877 Tracking Transfer (Loc: Wide Bay) — $23,734.35
+> 
+> Wide Bay / Indirect:
+>   DR 477.4 Wages-Indirect (Loc: Wide Bay) — $1,250.00
+>   DR 478.1 Super-Indirect (Loc: Wide Bay) — $150.00
+>   CR 877 Tracking Transfer (Loc: Wide Bay) — $1,400.00
+> 
+> Untracked payables (SC + WB combined):
+>   CR 803 Wages Payable — $169,844.06
+>   CR 825 PAYG Payable — $42,863.00
+>   CR 826 Super Payable — $24,360.46
+>   DR 877 Tracking Transfer (no location) — $237,067.52
+> 
+> SC tenant balance: $237,066.97 DR / $237,066.97 CR ✓
+> 
+> **CQ Xero journal — Payroll wk ending 24 Apr 2026 — Central Queensland**
+>   DR 477 Wages-Direct — $39,754.28
+>   DR 477.4 Wages-Indirect — $15,876.21
+>   DR 478 Super-Direct — $4,474.26
+>   DR 478.1 Super-Indirect — $1,905.15
+>   CR 803 Wages Payable — $45,717.49
+>   CR 825 PAYG Payable — $9,913.00
+>   CR 826 Super Payable — $6,379.41
+> 
+> CQ tenant balance: $62,009.90 DR / $62,009.90 CR ✓
+> 
+> Account codes match Craig's historical pattern (per Journal #673782).
+> Leave isn't separated in this v2 — folded into the wages lines.
 > Reply YES to confirm and I'll create both DRAFTS in Xero now.
-
-User: "YES" → script runs → returns 2 Xero deep-links.
