@@ -291,20 +291,23 @@ def build_sc_journal_lines(totals, codes, tracking):
         payables_acc["pretax_ded"]   += t.get("pretax_ded", 0)
 
     # Untracked payable CRs (combined across all SC + WB blocks).
-    # Wages Payable absorbs PostTaxDed; Super Payable absorbs PreTaxDed.
-    wages_payable_amt = _round(payables_acc["net"] + payables_acc["post_tax_ded"])
+    # Per Craig's pattern (Journal #673782): Wages Payable absorbs BOTH
+    # PreTaxDed AND PostTaxDed; Super Payable holds only EmployerSuper.
+    # (The salary-sacrifice $550 routes through 803 first and presumably
+    # gets transferred to 826 when the super clearing-house is paid.)
+    wages_payable_amt = _round(payables_acc["net"] + payables_acc["pretax_ded"] + payables_acc["post_tax_ded"])
     payg_total        = _round(payables_acc["payg"])
-    super_payable_amt = _round(payables_acc["super"] + payables_acc["pretax_ded"])
+    super_payable_amt = _round(payables_acc["super"])
     untracked_cr      = _round(wages_payable_amt + payg_total + super_payable_amt)
     if wages_payable_amt:
         lines.append({"LineAmount": -wages_payable_amt, "AccountCode": codes["wages_payable"],
-                      "Description": "Net pay + post-tax deductions (SC + WB) — Wages Payable"})
+                      "Description": "Net pay + salary-sacrifice + post-tax deductions (SC + WB) — Wages Payable"})
     if payg_total:
         lines.append({"LineAmount": -payg_total, "AccountCode": codes["payg_payable"],
                       "Description": "PAYG withholdings (SC + WB combined)"})
     if super_payable_amt:
         lines.append({"LineAmount": -super_payable_amt, "AccountCode": codes["super_payable"],
-                      "Description": "Employer super + salary-sacrifice (SC + WB) — Super Payable"})
+                      "Description": "Employer super SG (SC + WB) — Super Payable"})
 
     # Matching untracked 877 DR
     if untracked_cr:
@@ -339,18 +342,20 @@ def build_cq_journal_lines(totals, codes):
         pay["post_tax_ded"] += t.get("post_tax_ded", 0)
         pay["pretax_ded"]   += t.get("pretax_ded", 0)
 
-    wp = _round(pay["net"] + pay["post_tax_ded"])
+    # Same Craig pattern: Wages Payable gets PreTaxDed + PostTaxDed,
+    # Super Payable holds only EmployerSuper.
+    wp = _round(pay["net"] + pay["pretax_ded"] + pay["post_tax_ded"])
     payg = _round(pay["payg"])
-    sp = _round(pay["super"] + pay["pretax_ded"])
+    sp = _round(pay["super"])
     if wp:
         lines.append({"LineAmount": -wp,   "AccountCode": codes["wages_payable"],
-                      "Description": "Net pay + post-tax deductions (CQ) — Wages Payable"})
+                      "Description": "Net pay + salary-sacrifice + post-tax deductions (CQ) — Wages Payable"})
     if payg:
         lines.append({"LineAmount": -payg, "AccountCode": codes["payg_payable"],
                       "Description": "PAYG withholdings (CQ)"})
     if sp:
         lines.append({"LineAmount": -sp,   "AccountCode": codes["super_payable"],
-                      "Description": "Employer super + salary-sacrifice (CQ) — Super Payable"})
+                      "Description": "Employer super SG (CQ) — Super Payable"})
     return lines
 
 
