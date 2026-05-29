@@ -24,6 +24,7 @@ if str(_HERE.parent) not in sys.path:
     sys.path.insert(0, str(_HERE.parent))
 
 from scripts import alayacare_csv                # noqa: E402
+from scripts import mark_imports                  # noqa: E402
 from scripts import xero_revenue                 # noqa: E402
 from scripts.detectors import leakage as leakage_detector   # noqa: E402
 from scripts.detectors import pricing as pricing_detector   # noqa: E402
@@ -225,7 +226,10 @@ def _gather_findings() -> tuple[list[dict[str, Any]], bool]:
     papl_version = os.environ.get("NDIS_PAPL_VERSION", "2025-26 v1.1")
     sah_version = os.environ.get("SAH_PRICING_VERSION", "SaH 2025-11 v1")
 
-    csv_path = os.environ.get("ALAYACARE_SERVICE_EXPORT", "")
+    # Prefer Mark uploads when configured; fall back to local file otherwise.
+    csv_path = mark_imports.fetch_latest_to_tempfile("alayacare")
+    if csv_path is None:
+        csv_path = os.environ.get("ALAYACARE_SERVICE_EXPORT", "")
     load = alayacare_csv.load(csv_path)
     if load.missing:
         findings.append(_alayacare_missing_finding(csv_path))

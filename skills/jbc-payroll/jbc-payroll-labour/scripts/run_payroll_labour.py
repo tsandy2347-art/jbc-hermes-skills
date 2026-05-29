@@ -23,7 +23,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE.parent) not in sys.path:
     sys.path.insert(0, str(_HERE.parent))
 
-from scripts import myob_csv, alayacare_csv, schads_engine  # noqa: E402
+from scripts import myob_csv, alayacare_csv, schads_engine, mark_imports  # noqa: E402
 from scripts.detectors import award as award_det  # noqa: E402
 from scripts.detectors import integrity as integrity_det  # noqa: E402
 from scripts.detectors import labour as labour_det  # noqa: E402
@@ -205,8 +205,12 @@ def _gather_findings() -> list[dict[str, Any]]:
     target_cq = _env_float("LABOUR_COST_TARGET_PCT_CQ", 70.0)
 
     # --- MYOB ingest ---
-    myob = myob_csv.load(os.environ.get("MYOB_EXPORT_PATH",
-                                        "/data/hermes/imports/myob_latest.csv"))
+    # Prefer Mark uploads when configured; fall back to local file otherwise.
+    myob_path = mark_imports.fetch_latest_to_tempfile("myob")
+    if myob_path is None:
+        myob_path = os.environ.get("MYOB_EXPORT_PATH",
+                                    "/data/hermes/imports/myob_latest.csv")
+    myob = myob_csv.load(myob_path)
     if myob.missing:
         findings.append({
             "detector": "myob-export-missing",
@@ -227,8 +231,12 @@ def _gather_findings() -> list[dict[str, Any]]:
         })
 
     # --- AlayaCare ingest ---
-    ac = alayacare_csv.load(os.environ.get("ALAYACARE_EXPORT_PATH",
-                                           "/data/hermes/imports/alayacare_latest.csv"))
+    # Prefer Mark uploads when configured; fall back to local file otherwise.
+    ac_path = mark_imports.fetch_latest_to_tempfile("alayacare")
+    if ac_path is None:
+        ac_path = os.environ.get("ALAYACARE_EXPORT_PATH",
+                                 "/data/hermes/imports/alayacare_latest.csv")
+    ac = alayacare_csv.load(ac_path)
     if ac.missing:
         findings.append({
             "detector": "alayacare-export-missing",
