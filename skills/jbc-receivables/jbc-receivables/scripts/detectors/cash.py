@@ -35,27 +35,35 @@ def run_unallocated_receipts(
     *,
     now: _dt.datetime,
 ) -> list[dict[str, Any]]:
-    """A receipt is unallocated when it lacks an Invoice.InvoiceID link or
-    its linked invoice isn't in the open set, AND it's older than
-    `AR_UNALLOCATED_RECEIPT_AGE_DAYS` (default 2)."""
+    """A receipt is unallocated when it has NO linked invoice at all (the
+    payment was recorded without an Invoice.InvoiceID at the time). A payment
+    whose invoice has since been fully paid is NOT unallocated — that's the
+    normal happy-path lifecycle.
+
+    Gated on age >= `AR_UNALLOCATED_RECEIPT_AGE_DAYS` (default 2) and
+    deduped per PaymentID so a payment that appears more than once in
+    Xero's paginated response (which it does) only emits one finding.
+    """
     grace_days = _env_int("AR_UNALLOCATED_RECEIPT_AGE_DAYS", 2)
     findings: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for p in payments:
+        payment_id = p.get("PaymentID") or ""
+        if payment_id in seen:
+            continue
+        seen.add(payment_id)
         invoice = p.get("Invoice") or {}
         linked_id = invoice.get("InvoiceID")
-        if linked_id and linked_id in open_invoice_ids:
-            continue  # matched fine
-        # Fully-paid invoices have left the open pool. We treat these as
-        # unallocated only if also old — old payments with no open invoice
-        # behind them are the suspicious case.
+        # Truly unallocated = no linked invoice at all. Skip anything that
+        # was linked, even if the linked invoice is now closed.
+        if linked_id:
+            continue
         rec = parse_xero_date(p.get("Date"))
         if not rec:
             continue
         age_days = (now - rec).days
         if age_days < grace_days:
             continue
-
-        payment_id = p.get("PaymentID") or ""
         contact_name = (invoice.get("Contact") or {}).get("Name")
         contact_id = (invoice.get("Contact") or {}).get("ContactID") or payment_id
         ref = masked_ref(contact_name, contact_id) if contact_name else (
@@ -70,9 +78,8 @@ def run_unallocated_receipts(
             "entity_code": entity,
             "title": f"{entity}: unallocated receipt {ref} — {_fmt_aud(amount)}",
             "detail": (
-                f"Receipt of {_fmt_aud(amount)} dated {date_iso} has no link to a "
-                f"currently outstanding ACCREC invoice in {entity} "
-                f"({age_days} days old, grace {grace_days}). "
+                f"Receipt of {_fmt_aud(amount)} dated {date_iso} has no linked "
+                f"ACCREC invoice in {entity} ({age_days} days old, grace {grace_days}). "
                 f"Money is in but uncoded. Match to the right invoice "
                 f"or refund as appropriate."
             ),
