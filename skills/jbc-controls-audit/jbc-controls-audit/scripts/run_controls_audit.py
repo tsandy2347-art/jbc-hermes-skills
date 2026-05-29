@@ -233,14 +233,14 @@ def _persist_finding(conn, Jsonb, run_id: str, f: dict[str, Any]) -> bool:
             INSERT INTO findings
                 (id, source_agent, run_id, detector, domain, severity,
                  entity_code, is_people_flag, title, detail, amount,
-                 ai_explanation, evidence)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 ai_explanation, evidence, resolved)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 fid, SOURCE_AGENT, run_id, f["detector"], f["domain"],
                 f["severity"], f["entity_code"], is_people,
                 f["title"], f["detail"], f.get("amount"),
-                None, Jsonb(evidence),
+                None, Jsonb(evidence), bool(f.get("resolved", False)),
             ),
         )
     conn.commit()
