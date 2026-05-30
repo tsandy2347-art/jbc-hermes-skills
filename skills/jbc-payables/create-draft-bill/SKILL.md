@@ -1,7 +1,7 @@
 ---
 name: create-draft-bill
 description: Create a DRAFT supplier bill (AP invoice) in Xero for JBC SC or CQ. Status is hard-locked to DRAFT in code — Nicole / Tony / the external accountant clicks Post in Xero. The agent never posts. First JBC payables skill, replaces the Next.js payables-agent quarantine→draft flow.
-version: 0.2.0
+version: 0.3.0
 platforms: [linux, macos]
 metadata:
   hermes:
@@ -63,6 +63,12 @@ NOT for:
    the user.
 4. **Don't pre-validate account codes** against any chart — Hermes does
    not hold the JBC chart of accounts. Xero is the gate.
+5. **Tracking is OPTIONAL per line.** Max two Tracking entries per line
+   (Xero's two-dimensional model: typically Location + Cost Centre).
+   Xero validates Name + Option against the tenant's TrackingCategories
+   server-side; if either doesn't exist, Xero rejects with a clear error
+   which the skill relays verbatim. Do NOT pre-validate against any
+   cached list.
 
 ## Procedure
 
@@ -70,7 +76,8 @@ NOT for:
    - **entity** (`SC` or `CQ`)
    - **supplier name** (e.g. "Telstra") — or Xero ContactID if known
    - **lines**: each with `amount` (AUD, positive), `account_code`,
-     optional `description`
+     optional `description`, optional `tracking` (list of up to two
+     `{name, option}` dicts — typically Location and/or Cost Centre)
    - **date** (defaults to today, Brisbane)
    - **reference** (supplier's invoice number, optional)
 
@@ -78,18 +85,24 @@ NOT for:
    pick plausible AP chart codes (5xxx COGS, 6xxx operating expenses)
    and NOTE you're inferring so the user can correct before YES.
 
-3. Propose the draft inline (entity, supplier, date, line table, total).
+3. Tracking: if the invoice belongs to a specific Location and/or Cost
+   Centre in Xero, include them in the `tracking` array per line.
+   Common pairs at JBC: `WIDE BAY` + `SIL House` for SIL-house expenses;
+   `SUNSHINE COAST` + `Office Admin` for SC head-office bills. Omit
+   tracking entirely if you don't know — Nicole can code it in Xero.
+
+4. Propose the draft inline (entity, supplier, date, line table, total).
    End with: **"Reply YES to confirm and I'll create the draft in Xero now."**
 
-4. ON EXPLICIT YES — and only then — invoke the Python below via the
+5. ON EXPLICIT YES — and only then — invoke the Python below via the
    `execute_code` tool, substituting the user's parameters into
    `PARAMS` at the top. Do NOT call this on an ambiguous reply.
 
-5. Quote the result back to the user — `InvoiceNumber`, `Total`,
+6. Quote the result back to the user — `InvoiceNumber`, `Total`,
    `xero_link` — and add: "Nicole / Tony / the external accountant
    clicks Post in Xero when ready."
 
-6. On error from Xero, relay the error message verbatim and ask how
+7. On error from Xero, relay the error message verbatim and ask how
    the user wants to proceed.
 
 ## The script (run via execute_code on YES)
@@ -108,6 +121,12 @@ PARAMS = {
     "narration": None,                # appended to reference for traceability
     "lines": [
         {"amount": 1.00, "account_code": "6010", "description": "Smoke test"},
+        # Optional per-line `tracking` (max 2 entries):
+        # {"amount": 1.00, "account_code": "6010", "description": "Smoke test",
+        #  "tracking": [
+        #      {"name": "Location", "option": "WIDE BAY"},
+        #      {"name": "Cost Centre", "option": "SIL House"},
+        #  ]},
     ],
 }
 # ──────────────────────────────────────────────────────────────
@@ -163,13 +182,30 @@ def create_draft_bill(p):
             raise ValueError(f"lines[{i}].amount must be positive")
         if not str(ln.get("account_code", "")).strip():
             raise ValueError(f"lines[{i}].account_code required")
-        payload_lines.append({
+        line_payload = {
             "Description": ln.get("description") or p["supplier_name"],
             "Quantity": ln.get("quantity", 1),
             "UnitAmount": float(ln["amount"]),
             "AccountCode": str(ln["account_code"]).strip(),
             **({"TaxType": ln["tax_type"]} if ln.get("tax_type") else {}),
-        })
+        }
+        tracking = ln.get("tracking")
+        if tracking:
+            if not isinstance(tracking, list):
+                raise ValueError(f"lines[{i}].tracking must be a list of {{name, option}} dicts")
+            if len(tracking) > 2:
+                raise ValueError(f"lines[{i}].tracking accepts at most 2 entries (Xero's two-dimensional model)")
+            tpayload = []
+            for j, t in enumerate(tracking):
+                if not isinstance(t, dict):
+                    raise ValueError(f"lines[{i}].tracking[{j}] must be a {{name, option}} dict")
+                name = str(t.get("name", "")).strip()
+                option = str(t.get("option", "")).strip()
+                if not name or not option:
+                    raise ValueError(f"lines[{i}].tracking[{j}] requires non-empty 'name' and 'option'")
+                tpayload.append({"Name": name, "Option": option})
+            line_payload["Tracking"] = tpayload
+        payload_lines.append(line_payload)
 
     brisbane_now = _dt.datetime.now(_dt.timezone.utc).astimezone(
         _dt.timezone(_dt.timedelta(hours=10))
@@ -260,3 +296,22 @@ NOTE you guessed codes, ask user to correct or YES.
 ### C. Bad code, Xero rejects
 Script returns `{"ok": false, "error": "Xero 400: Account code 9999 has not been found"}`.
 Quote the message, ask user for a real code, retry.
+
+### D. Single-line with tracking — Officeworks delivery to a SIL house
+> User: "Draft $121.25 Officeworks bill to SC, code 417.11, location WIDE BAY, cost centre SIL House, narration cleaning supplies for 70 Jupiter St"
+
+On YES, set PARAMS lines:
+```
+entity: "SC", supplier_name: "Officeworks",
+narration: "cleaning supplies for 70 Jupiter St",
+lines: [
+  {"amount": 121.25, "account_code": "417.11",
+   "description": "cleaning supplies for 70 Jupiter St",
+   "tracking": [
+     {"name": "Location",    "option": "WIDE BAY"},
+     {"name": "Cost Centre", "option": "SIL House"},
+   ]},
+]
+```
+Run the block. Xero validates the Location/Cost Centre names server-side;
+if either doesn't match the tenant's TrackingCategories, relay the error verbatim.
