@@ -209,7 +209,12 @@ def parse_summary(path):
         if a:
             m = re.search(r'PAY-\d+', str(a))
             if m:
-                current_run = m.group(0)
+                # Skip cancelled / voided runs — they shouldn't post to Xero
+                status_l = str(a).lower()
+                if any(bad in status_l for bad in ('cancelled', 'voided', 'deleted')):
+                    current_run = None  # skip subsequent dept rows for this run
+                else:
+                    current_run = m.group(0)
             current_branch = None
             continue
         if b:
@@ -365,17 +370,23 @@ def split_by_tenant(gl_agg):
 # ── 5. Build full balanced journals ───────────────────────────────────────────
 
 def build_sc_journal(sc_dr_lines, summary_by_run_branch, sc_runs):
-    """Build SC tenant journal: DRs + payable CRs + 877 clearing.
+    """Build SC tenant journal: DRs + payable CRs.
 
-    DRs: per (GL, sub-account), tagged with Location = sub-account's branch (SC or WB)
-    CRs: 803 (wages), 825 (PAYG), 826 (super), all untracked
-    877: ONE CR line per Location (matches sum of DRs for that location)
-         ONE DR untracked (matches sum of CR payables)
+    Craig's actual pattern (verified via API on Journal #673782 = ID a747fe21):
+    - 23 expense DR lines, each Location-tagged
+    - 22 payable CR lines (803/825/826), UNTRACKED, grouped by some implicit
+      posting class (Craig had multiple per account — we collapse to one per
+      tenant for simplicity)
+    - NO 877 entries (the 877 visible in print/Account Transactions is a
+      Xero-side auto-display for tracking-imbalance — not in the journal)
+
+    DR == CR by gross-pay identity: Gross+Super = Net + PAYG + Super + PreTax + PostTax
+    Any small variance from Detail/Summary mismatch absorbed into largest 477 line.
     """
     expense_dr_lines = []
+    dr_sum = 0.0
 
-    # Build expense DR lines + track by-location totals
-    sc_dr_by_loc = defaultdict(float)
+    # Build expense DR lines + track by-location totals (for bal-adj on 477)
     for (gl, sub), amt in sorted(sc_dr_lines.items(), key=lambda kv: (kv[0][0], kv[0][1])):
         if amt == 0:
             continue
@@ -388,10 +399,10 @@ def build_sc_journal(sc_dr_lines, summary_by_run_branch, sc_runs):
         }
         if loc:
             line['_location_name'] = loc
-            sc_dr_by_loc[loc] += amt
         expense_dr_lines.append(line)
+        dr_sum += round(amt, 2)
 
-    # Sum payable CRs from Summary tuples for SC + WB branches
+    # Payable CRs (untracked) from Summary tuples — SC + WB combined
     sc_net = sum(summary_by_run_branch.get((run, br), {}).get('net', 0)
                  for run in sc_runs for br in ('SC', 'WB'))
     sc_pretax = sum(summary_by_run_branch.get((run, br), {}).get('pretax_ded', 0)
@@ -406,6 +417,22 @@ def build_sc_journal(sc_dr_lines, summary_by_run_branch, sc_runs):
     wages_pay = round(sc_net + sc_pretax + sc_posttax, 2)
     payg_pay = round(sc_payg, 2)
     super_pay = round(sc_super, 2)
+    cr_sum = wages_pay + payg_pay + super_pay
+
+    # Balance adjustment — absorb DR-CR variance on largest SC 477 line
+    delta = round(cr_sum - dr_sum, 2)
+    if abs(delta) >= 0.01:
+        target_idx = None
+        target_amt = 0.0
+        for i, line in enumerate(expense_dr_lines):
+            if line['AccountCode'] == '477' and line.get('_location_name') == 'Sunshine Coast':
+                if line['LineAmount'] > target_amt:
+                    target_amt = line['LineAmount']
+                    target_idx = i
+        if target_idx is not None:
+            expense_dr_lines[target_idx]['LineAmount'] = round(
+                expense_dr_lines[target_idx]['LineAmount'] + delta, 2)
+            expense_dr_lines[target_idx]['Description'] += f" [+${delta:,.2f} bal-adj]"
 
     payable_cr_lines = [
         {'LineAmount': -wages_pay, 'AccountCode': CODES['wages_payable'],
@@ -416,39 +443,17 @@ def build_sc_journal(sc_dr_lines, summary_by_run_branch, sc_runs):
          'Description': 'Employer super SG (SC + WB)', 'Tracking': []},
     ]
 
-    # 877 clearing — one CR per location matching DR sum (rounded carefully)
-    clearing_cr_lines = []
-    total_dr_locs = 0.0
-    for loc, total in sorted(sc_dr_by_loc.items()):
-        t = round(total, 2)
-        total_dr_locs += t
-        clearing_cr_lines.append({
-            'LineAmount': -t, 'AccountCode': CODES['tracking_xfer'],
-            'Description': f"Tracking Transfer — {loc}",
-            'Tracking': [], '_location_name': loc,
-        })
-
-    # 877 DR untracked = total payable CRs (so DR=CR overall)
-    untracked_dr = round(wages_pay + payg_pay + super_pay, 2)
-    clearing_dr = {'LineAmount': untracked_dr, 'AccountCode': CODES['tracking_xfer'],
-                   'Description': 'Tracking Transfer — payable clearing (no location)',
-                   'Tracking': []}
-
-    # Balance check:
-    # DR side = expense_DRs + clearing_DR_untracked
-    # CR side = payables (untracked) + clearing_CRs (per location)
-    # For DR == CR we need:
-    #   sum(expense_DRs) + untracked_DR == sum(payables) + sum(clearing_CR_per_loc)
-    #   sum(expense_DRs) + sum(payables) == sum(payables) + sum(expense_DRs)
-    # Identity holds by construction IF sum(clearing_CR_per_loc) == sum(expense_DRs by loc)
-    # and untracked_DR == sum(payables). Both true above.
-
-    return expense_dr_lines + payable_cr_lines + clearing_cr_lines + [clearing_dr]
+    return expense_dr_lines + payable_cr_lines
 
 
 def build_cq_journal(cq_dr_lines, summary_by_run_branch, cq_runs):
-    """Build CQ tenant journal: DRs + payable CRs (no location, no 877)."""
+    """Build CQ tenant journal: DRs + payable CRs (no location, no 877).
+
+    Forces DR == CR by adjusting the 477 wages-direct DR to absorb any
+    Detail Report vs Summary tuple variance (typically small orphan lines).
+    """
     lines = []
+    dr_sum = 0.0
     for (gl, sub), amt in sorted(cq_dr_lines.items(), key=lambda kv: (kv[0][0], kv[0][1])):
         if amt == 0:
             continue
@@ -458,6 +463,7 @@ def build_cq_journal(cq_dr_lines, summary_by_run_branch, cq_runs):
             'Description': f"{sub} ({gl})" if sub else gl,
             'Tracking': [],
         })
+        dr_sum += round(amt, 2)
 
     cq_net = sum(summary_by_run_branch.get((run, 'CQ'), {}).get('net', 0) for run in cq_runs)
     cq_pretax = sum(summary_by_run_branch.get((run, 'CQ'), {}).get('pretax_ded', 0) for run in cq_runs)
@@ -468,6 +474,27 @@ def build_cq_journal(cq_dr_lines, summary_by_run_branch, cq_runs):
     wages_pay = round(cq_net + cq_pretax + cq_posttax, 2)
     payg_pay = round(cq_payg, 2)
     super_pay = round(cq_super, 2)
+    cr_sum = wages_pay + payg_pay + super_pay
+
+    # Balance adjustment — absorb DR-CR variance on 477 (catch-all wages account)
+    delta = round(cr_sum - dr_sum, 2)
+    if abs(delta) >= 0.01:
+        # Find the largest 477 line and adjust it (or add a new line)
+        adjusted = False
+        for line in lines:
+            if line['AccountCode'] == '477':
+                line['LineAmount'] = round(line['LineAmount'] + delta, 2)
+                line['Description'] += f" [+${delta:,.2f} bal-adj]"
+                adjusted = True
+                break
+        if not adjusted:
+            # No 477 line existed — add one
+            lines.append({
+                'LineAmount': delta,
+                'AccountCode': '477',
+                'Description': f'Balance adjustment to match Summary tuple totals',
+                'Tracking': [],
+            })
 
     lines.append({'LineAmount': -wages_pay, 'AccountCode': CODES['wages_payable'],
                   'Description': 'Net pay + deductions (CQ)', 'Tracking': []})
@@ -548,7 +575,7 @@ def _xero_get(creds, token, path):
 
 
 def discover_sc_tracking(creds, token):
-    """Find SC Location tracking category + SC/WB option IDs."""
+    """Find SC Location tracking category + SC/WB option IDs + system account IDs."""
     data = _xero_get(creds, token, "/TrackingCategories")
     cats = data.get('TrackingCategories', [])
     target = next((c for c in cats if c.get('Name', '').strip().lower() == 'location'
@@ -560,15 +587,36 @@ def discover_sc_tracking(creds, token):
     wb = options.get('Wide Bay')
     if not sc or not wb:
         raise RuntimeError(f"Sunshine Coast/Wide Bay not in Location options — saw: {list(options.keys())}")
+    # Look up 877 AccountID (it's a system account — must use AccountID not AccountCode)
+    accounts_data = _xero_get(creds, token, "/Accounts")
+    acct_877 = next((a for a in accounts_data.get('Accounts', [])
+                     if a.get('Code') == '877'), None)
+    if not acct_877:
+        raise RuntimeError("Account 877 not found in SC chart")
     return {
         'category_id': target['TrackingCategoryID'],
         'sc_option_id': sc['TrackingOptionID'],
         'wb_option_id': wb['TrackingOptionID'],
+        'account_877_id': acct_877['AccountID'],
     }
 
 
+def discover_cq_accounts(creds, token):
+    """CQ — just need 877 AccountID (no tracking)."""
+    accounts_data = _xero_get(creds, token, "/Accounts")
+    acct_877 = next((a for a in accounts_data.get('Accounts', [])
+                     if a.get('Code') == '877'), None)
+    if not acct_877:
+        raise RuntimeError("Account 877 not found in CQ chart")
+    return {'account_877_id': acct_877['AccountID']}
+
+
 def attach_tracking(lines, tracking):
-    """Replace `_location_name` placeholders with Xero TrackingCategoryID/OptionID."""
+    """Replace `_location_name` placeholders with Xero TrackingCategoryID/OptionID.
+    Also swap AccountCode='877' for AccountID (877 is a Xero SYSTEM account —
+    'Account code 877 has been removed as it does not match a recognised account'
+    if posted by Code).
+    """
     out = []
     for l in lines:
         l = dict(l)
@@ -581,6 +629,10 @@ def attach_tracking(lines, tracking):
                               'TrackingOptionID':   tracking['wb_option_id']}]
         else:
             l['Tracking'] = []
+        # Swap 877 code for AccountID (system account workaround)
+        if l.get('AccountCode') == '877' and 'account_877_id' in tracking:
+            l.pop('AccountCode', None)
+            l['AccountID'] = tracking['account_877_id']
         out.append(l)
     return out
 
@@ -594,13 +646,19 @@ def post_draft(entity, narration, journal_date, lines):
         raise RuntimeError(f"XERO_{entity}_TENANT_ID not set")
     token = _xero_token(creds)
 
-    # SC needs location tracking attached
+    # SC needs location tracking + 877 system-account ID swap
     if entity.upper() == 'SC':
         tracking = discover_sc_tracking(creds, token)
         lines = attach_tracking(lines, tracking)
     else:
-        # CQ — strip any _location_name placeholders
+        # CQ — no location tracking, but still need 877 system-account ID swap (if used)
+        cq_meta = discover_cq_accounts(creds, token)
         lines = [{k: v for k, v in l.items() if not k.startswith('_')} for l in lines]
+        # Swap 877 code for AccountID if any line uses it
+        for l in lines:
+            if l.get('AccountCode') == '877':
+                l.pop('AccountCode', None)
+                l['AccountID'] = cq_meta['account_877_id']
 
     dr, cr, bal = balance_check(lines, entity)
     if not bal:
@@ -655,7 +713,14 @@ def main():
     ap.add_argument('--journal-date', help='Journal date YYYY-MM-DD (default: pay period end)')
     ap.add_argument('--narration', help='Narration (default: auto-generated)')
     ap.add_argument('--post-draft', action='store_true', help='Actually POST to Xero (otherwise just preview)')
+    ap.add_argument('--json', action='store_true', help='Emit machine-readable JSON to stdout (for UI integration)')
     args = ap.parse_args()
+
+    if args.json:
+        # Silence text output for JSON consumers
+        import io
+        sys.stdout = io.StringIO()  # capture all print() calls so they don't pollute JSON output
+        _json_buffer = sys.stdout
 
     print(f"=== Loading MYOB exports ===")
     summary, meta = parse_summary(args.summary)
@@ -710,27 +775,84 @@ def main():
     if cq_lines:
         render_journal(cq_lines, f"CQ TENANT JOURNAL — runs {','.join(cq_runs)} — date {journal_date}")
 
+    posted = {'sc': None, 'cq': None}
     if args.post_draft:
         print(f"\n=== Posting DRAFTs to Xero ===")
         if sc_lines:
             try:
                 result = post_draft('SC', narration + ' (SC + Wide Bay)', journal_date, sc_lines)
+                posted['sc'] = result
                 print(f"  SC: ✓ ManualJournalID={result['ManualJournalID']} ({result['Status']}) "
                       f"DR=${result['TotalDR']:,.2f} CR=${result['TotalCR']:,.2f}")
                 print(f"      Link: {result['xero_link']}")
             except Exception as e:
+                posted['sc'] = {'error': str(e)}
                 print(f"  SC: ✗ {e}")
         if cq_lines:
             try:
                 cq_narration = narration.replace('SC + Wide Bay', '').strip() + ' (CQ)'
                 result = post_draft('CQ', cq_narration, journal_date, cq_lines)
+                posted['cq'] = result
                 print(f"  CQ: ✓ ManualJournalID={result['ManualJournalID']} ({result['Status']}) "
                       f"DR=${result['TotalDR']:,.2f} CR=${result['TotalCR']:,.2f}")
                 print(f"      Link: {result['xero_link']}")
             except Exception as e:
+                posted['cq'] = {'error': str(e)}
                 print(f"  CQ: ✗ {e}")
     else:
         print(f"\n[Preview mode — pass --post-draft to actually POST to Xero]")
+
+    if args.json:
+        # Compute PAYG totals from Summary tuples
+        sc_payg = sum(summary.get((run, br), {}).get('payg', 0) for run in sc_runs for br in ('SC','WB'))
+        sc_super = sum(summary.get((run, br), {}).get('employer_super', 0) for run in sc_runs for br in ('SC','WB'))
+        sc_net = sum(summary.get((run, br), {}).get('net', 0) for run in sc_runs for br in ('SC','WB'))
+        cq_payg = sum(summary.get((run, br), {}).get('payg', 0) for run in cq_runs for br in ('CQ',))
+        cq_super = sum(summary.get((run, br), {}).get('employer_super', 0) for run in cq_runs for br in ('CQ',))
+        cq_net = sum(summary.get((run, br), {}).get('net', 0) for run in cq_runs for br in ('CQ',))
+
+        # Sanitize lines for JSON
+        def clean_lines(lines):
+            return [{k: v for k, v in l.items() if not k.startswith('_')} for l in lines]
+
+        result = {
+            'ok': True,
+            'meta': {
+                'pay_period_from': _excel_to_iso(meta.get('from','')),
+                'pay_period_to':   _excel_to_iso(meta.get('to','')),
+                'journal_date':    journal_date,
+                'sc_runs':         list(sc_runs),
+                'cq_runs':         list(cq_runs),
+            },
+            'sc': {
+                'lines':       clean_lines(sc_lines),
+                'total_dr':    round(sum(l['LineAmount'] for l in sc_lines if l['LineAmount']>0), 2),
+                'total_cr':    round(-sum(l['LineAmount'] for l in sc_lines if l['LineAmount']<0), 2),
+                'payg':        round(sc_payg, 2),
+                'super_sg':    round(sc_super, 2),
+                'net_pay':     round(sc_net, 2),
+                'narration':   narration + ' (SC + Wide Bay)' if sc_runs else None,
+            } if sc_runs else None,
+            'cq': {
+                'lines':       clean_lines(cq_lines),
+                'total_dr':    round(sum(l['LineAmount'] for l in cq_lines if l['LineAmount']>0), 2),
+                'total_cr':    round(-sum(l['LineAmount'] for l in cq_lines if l['LineAmount']<0), 2),
+                'payg':        round(cq_payg, 2),
+                'super_sg':    round(cq_super, 2),
+                'net_pay':     round(cq_net, 2),
+                'narration':   narration.replace('SC + Wide Bay','').strip() + ' (CQ)' if cq_runs else None,
+            } if cq_runs else None,
+            'totals': {
+                'payg_combined': round(sc_payg + cq_payg, 2),
+                'super_combined': round(sc_super + cq_super, 2),
+                'net_combined': round(sc_net + cq_net, 2),
+            },
+            'posted': posted,
+            'log': _json_buffer.getvalue(),
+        }
+        # Restore stdout + emit clean JSON
+        sys.stdout = sys.__stdout__
+        print(json.dumps(result, default=str))
 
 
 if __name__ == '__main__':
