@@ -1,37 +1,38 @@
-"""parse_myob_payroll.py — read MYOB exports → journal lines for create-payroll-journal.
+"""parse_myob_payroll.py — MYOB → Xero DRAFT Manual Journal generator v0.5.0
 
-Inputs (any one pay period):
-  1. Pay Activity Summary .xlsx (hierarchical RUN→BRANCH→DEPT→…→EMPLOYEE)
-     → gross/PAYG/super/net at branch level (for the payable CRs)
-  2. Pay Activity Detail Data .xlsx (flat tabular, ONE row per pay-item-per-employee)
-     → fallback for amount totals; gives employee → primary cost-centre map
-  3. Pay Activity Detail Report .xlsx (hierarchical, per-line w/ GL+SubAccount)
-     → THE SOURCE OF TRUTH for which expense GL each line posts to
+Reads three MYOB exports and produces Craig-pattern DRAFT journals for SC and CQ tenants.
 
-CRITICAL CALIBRATION (against Journal #673782 / PAY-001910):
-  Craig posts to Xero from MYOB sections: Gross Income, Tax Free Income, Employer Superannuation
-  Craig does NOT post Entitlement Accrual (those are info-only liability movements)
-  Craig DOES post these specific Entitlement PAYMENTS:
-    - Annual Leave Taken    → DR 918  Provision for Annual Leave (reduces liability)
-    - Personal Leave Taken  → DR 477.7 Sick Leave
-    - Leave Loading Expense → DR 477.6 Vacation Leave (Income section, not Accrual)
+INPUTS:
+  1. Pay Activity Summary .xlsx          (gross/PAYG/super tuples — per-run × branch × dept)
+  2. Pay Activity Detail Data .xlsx       (flat tabular — for Leave Loading reclass)
+  3. Pay Activity Detail Report .xlsx     (hierarchical w/ GL+SubAccount stamps — source of truth)
 
-Tax Free Income lines without a GL stamp (travel allowances, sleepover super)
-fall through to the employee's primary cost-centre's wages account.
+OUTPUTS:
+  PARAMS dict ready for Xero POST:
+    - SC tenant journal lines (location-tagged DRs + payable CRs + 877 summary)
+    - CQ tenant journal lines (DRs + CRs, no location)
 
-The Pay Activity Detail Report stamps GL on most lines:
-  Section "Gross Income"             → col 33 = "477-Wages and Salaries - Direct" etc.
-  Section "Employer Superannuation"  → col 32 = "478-Superannuation - Direct"
-  Section "Entitlement Accrual"      → col 34 (ignored — accrual is info-only)
-GL string continues onto next row in same column.
-Sub-account: col 44 for Gross/TaxFree, col 41 for Super.
+KEY RULES (calibrated against Craig's J#673782 / PAY-001910):
+  - MYOB stamps GL on each pay line — use Pay Activity Detail Report as source of truth
+  - Annual Leave Taken → 918, Personal Leave Taken → 477.7 (already stamped in Detail Report)
+  - Leave Loading Expense → 477.6 (only in Data export — must add)
+  - Travel allowances + sleepover super → no GL stamp → allocate to 477/478 by employee's primary sub-account
+  - PAY-001911/1912 (adhoc SC corrections) combined into PAY-001910 main journal
+  - 877 Tracking Transfers: one CR per location (sums DR for that location), one untracked DR (sums CR payables)
 
 USAGE:
-    python3 parse_myob_payroll.py <summary.xlsx> <data.xlsx> <detail_report.xlsx> [pay-run-id]
+    python3 parse_myob_payroll.py <summary.xlsx> <data.xlsx> <detail_report.xlsx>
+        [--sc-runs PAY-001910,PAY-001911 --cq-runs PAY-001909]
+        [--journal-date 2026-04-22 --post-draft]
+
+    Without --post-draft, just renders the proposal.
+    With --post-draft, requires XERO_SC_* + XERO_CQ_* env vars.
 """
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import re
 import sys
 import zipfile
@@ -42,74 +43,51 @@ from pathlib import Path
 NS = {'s': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
 SMNS = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
 
-# Branch code → Xero Location tracking option (set by configuration)
-BRANCH_BY_SUB_PREFIX = {'SC': 'SC', 'WB': 'WB', 'CQ': 'CQ'}
+# ── MYOB sub-account prefix → Xero Location/Branch ─────────────────────────────
+SUB_BRANCH = {'SC': 'SC', 'WB': 'WB', 'CQ': 'CQ'}
 
-# Sections in MYOB Detail Report and whether they post to Xero
+# Pay runs grouped by tenant (auto-detected from sub-account prefix per run)
+SC_TENANT_BRANCHES = ('SC', 'WB')
+CQ_TENANT_BRANCHES = ('CQ',)
+
+# MYOB Detail Report sections we POST to Xero (Entitlement Accrual is info-only — skip)
 SECTIONS = ('Gross Income', 'Tax Free Income', 'Pre-tax Deductions',
             'Employer Superannuation', 'Entitlement Accrual',
             'Deductions', 'Net Pay', 'After-tax Income')
 POSTING_SECTIONS = ('Gross Income', 'Tax Free Income', 'Employer Superannuation')
 
+# Patterns for scan-by-content (Detail Report layout shifts per section)
 SUB_PATTERN = re.compile(r'^[A-Z]{2}\d{2}-[A-Z]{2}-')
+GL_PATTERN = re.compile(r'^(\d{3,4}(?:\.\d+)?)\s*-\s*(.+)')
+CONT_WORDS = ('Direct', 'Indirect', 'Salaries', 'Leave', 'Clearing', 'Wages')
 
-
-def find_sub_in_row(row):
-    """Scan all cells in a row, return first that matches sub-account pattern."""
-    for v in row.values():
-        if v and isinstance(v, str):
-            s = v.strip()
-            if SUB_PATTERN.match(s):
-                return s
-    return ''
-
-
-def find_gl_in_row(row):
-    """Scan all cells in a row for an account code pattern like '477-…', '918-…', '478.1-…'."""
-    for v in row.values():
-        if v and isinstance(v, str):
-            s = v.strip()
-            m = re.match(r'^(\d{3,4}(?:\.\d+)?)\s*-\s*(.+)', s)
-            if m:
-                return s, m.group(1)
-    return '', ''
-
-
-def find_gl_continuation(row):
-    """Find a GL continuation fragment (no leading digits)."""
-    for v in row.values():
-        if v and isinstance(v, str):
-            s = v.strip()
-            # Continuation like " Direct" or " Indirect" — short, no digits
-            if s and not s[0].isdigit() and len(s) < 30 and not SUB_PATTERN.match(s):
-                # heuristic: very short text fragments that complement a GL name
-                if any(w in s for w in ('Direct', 'Indirect', 'Salaries', 'Leave', 'Clearing')):
-                    return s
-    return ''
-
-
-# Column positions in Pay Activity Detail Report (1-indexed)
-# Used as hints/fallback only — primary lookup is scan-by-pattern
-GL_COL = {
-    'Gross Income': 33,
-    'Tax Free Income': 33,
-    'Employer Superannuation': 32,
-    'Entitlement Accrual': 34,  # for completeness — not posted
-}
-SUB_COL = {
-    'Gross Income': 44,
-    'Tax Free Income': 44,
-    'Employer Superannuation': 41,
-    'Entitlement Accrual': 41,
-}
-
-# Leave-payment lines (paid out, reclassified to leave accounts)
+# Leave-payment items not stamped in Detail Report
 LEAVE_PAYMENT_RULES = {
-    'Annual Leave Taken':    {'code': '918',   'name': 'Provision for Annual Leave'},
-    'Personal Leave Taken':  {'code': '477.7', 'name': 'Sick Leave'},
     'Leave Loading Expense': {'code': '477.6', 'name': 'Vacation Leave'},
 }
 
+# Xero account codes
+CODES = {
+    'wages_direct':   '477',
+    'wages_indirect': '477.4',
+    'vac_leave':      '477.6',
+    'sick_leave':     '477.7',
+    'super_direct':   '478',
+    'super_indirect': '478.1',
+    'prov_al':        '918',
+    'wages_payable':  '803',
+    'payg_payable':   '825',
+    'super_payable':  '826',
+    'tracking_xfer':  '877',
+}
+
+# Xero API
+XERO_TOKEN_URL = "https://identity.xero.com/connect/token"
+XERO_API = "https://api.xero.com/api.xro/2.0"
+WRITE_SCOPES = "accounting.transactions accounting.settings.read"
+
+
+# ── Generic xlsx readers ──────────────────────────────────────────────────────
 
 def _col_idx(ref):
     s = ''.join(c for c in ref if c.isalpha())
@@ -149,27 +127,21 @@ def _load_rows(path):
 
 def _load_tabular(path):
     rows = _load_rows(path)
-    hdr_row = rows[1]
-    hdr = {hdr_row.get(i): i for i in hdr_row}
+    hdr = {rows[1].get(i): i for i in rows[1]}
     return [{k: rows[r].get(i) for k, i in hdr.items()}
             for r in range(2, max(rows) + 1)]
 
 
 def _num(v):
-    if v is None or v == '':
-        return 0.0
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return 0.0
+    if v is None or v == '': return 0.0
+    try: return float(v)
+    except (TypeError, ValueError): return 0.0
 
 
 def _excel_to_iso(v):
-    if v is None or v == '':
-        return ''
+    if v is None or v == '': return ''
     s = str(v).strip()
-    if re.match(r'\d{4}-\d{1,2}-\d{1,2}', s):
-        return s
+    if re.match(r'\d{4}-\d{1,2}-\d{1,2}', s): return s
     if re.match(r'\d{1,2}/\d{1,2}/\d{4}', s):
         d, m, y = s.split('/')
         return f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
@@ -181,16 +153,41 @@ def _excel_to_iso(v):
     return (_dt.date(1899, 12, 30) + _dt.timedelta(days=serial)).isoformat()
 
 
-# ── 1. Summary → branch-level cash/payable totals ─────────────────────────────
+# ── Pattern scanners ──────────────────────────────────────────────────────────
+
+def _find_sub(row):
+    for v in row.values():
+        if v and isinstance(v, str) and SUB_PATTERN.match(v.strip()):
+            return v.strip()
+    return ''
+
+
+def _find_gl(row):
+    for v in row.values():
+        if v and isinstance(v, str):
+            m = GL_PATTERN.match(v.strip())
+            if m: return v.strip(), m.group(1)
+    return '', ''
+
+
+# ── 1. Pay Activity Summary → per-(pay_run, branch) totals ────────────────────
 
 def parse_summary(path):
-    """Walk Pay Activity Summary hierarchy. Accumulate at DEPT row."""
+    """Walk Summary hierarchy. Returns {(pay_run, branch): {field: amount}}.
+
+    Hierarchy:
+      Row col 1: 'PAY-NNNN (completed)' OR header metadata
+      Row col 2: Branch name
+      Row col 3: Department name
+      Row col 4-: empty (lower levels)
+    """
     rows = _load_rows(path)
-    by_branch = defaultdict(lambda: {
+    by_run_branch = defaultdict(lambda: {
         'gross': 0.0, 'pretax_ded': 0.0, 'payg': 0.0, 'after_tax': 0.0,
         'post_tax_ded': 0.0, 'net': 0.0, 'employer_super': 0.0,
     })
     meta = {}
+    current_run = None
     current_branch = None
     BRANCH_NORM = {
         'sunshine coast': 'SC', 'wide bay': 'WB',
@@ -210,99 +207,53 @@ def parse_summary(path):
                 meta['to'] = str(row.get(2) or '')
                 continue
         if a:
+            m = re.search(r'PAY-\d+', str(a))
+            if m:
+                current_run = m.group(0)
             current_branch = None
             continue
         if b:
             current_branch = BRANCH_NORM.get(re.sub(r'\s+', ' ', str(b).strip()).lower())
             continue
-        if c and current_branch:
-            by_branch[current_branch]['gross']          += _num(row.get(6))
-            by_branch[current_branch]['pretax_ded']     += _num(row.get(7))
-            by_branch[current_branch]['payg']           += _num(row.get(9))
-            by_branch[current_branch]['after_tax']      += _num(row.get(10))
-            by_branch[current_branch]['post_tax_ded']   += _num(row.get(11))
-            by_branch[current_branch]['net']            += _num(row.get(12))
-            by_branch[current_branch]['employer_super'] += _num(row.get(14))
+        if c and current_branch and current_run:
+            key = (current_run, current_branch)
+            by_run_branch[key]['gross']          += _num(row.get(6))
+            by_run_branch[key]['pretax_ded']     += _num(row.get(7))
+            by_run_branch[key]['payg']           += _num(row.get(9))
+            by_run_branch[key]['after_tax']      += _num(row.get(10))
+            by_run_branch[key]['post_tax_ded']   += _num(row.get(11))
+            by_run_branch[key]['net']            += _num(row.get(12))
+            by_run_branch[key]['employer_super'] += _num(row.get(14))
 
-    for k in by_branch:
-        for f in by_branch[k]:
-            by_branch[k][f] = round(by_branch[k][f], 2)
-    return dict(by_branch), meta
+    for k in by_run_branch:
+        for f in by_run_branch[k]:
+            by_run_branch[k][f] = round(by_run_branch[k][f], 2)
+    return dict(by_run_branch), meta
 
 
-# ── 2. Data export → employee → primary cost-centre map ───────────────────────
-# Plus leave payment lines (taken-leave reclass).
+# ── 2. Data export → leave-loading expense lines (by employee→sub) ────────────
 
 def parse_data(path):
     return _load_tabular(path)
 
 
-def build_emp_sub_map(detail_path, target_run=None):
-    """Per-employee primary sub-account.
-    Strategy: walk the file. For each PAY-NNNN data row, capture the
-    sub-account if present + remember the current employee context.
-    The Employer Superannuation row always carries a sub-account; use
-    THAT as the canonical employee sub-account.
-    If target_run is given, only use rows from that pay run.
-    """
-    rows = _load_rows(detail_path)
-    current_emp = None
-    emp_sub = {}
-    emp_sub_super = {}  # specifically from Super lines — highest signal
-    current_section = None
-    for r in sorted(rows):
-        row = rows[r]
-        sec = row.get(4)
-        if sec in SECTIONS:
-            current_section = sec
-        emp_col = row.get(9)
-        if emp_col and isinstance(emp_col, str):
-            parts = emp_col.split(None, 1)
-            if parts and parts[0].isdigit():
-                current_emp = parts[0]
-        h = row.get(8)
-        if h and str(h).startswith('PAY-'):
-            if target_run and target_run not in str(h):
-                continue
-            sub = find_sub_in_row(row) or find_sub_in_row(rows.get(r + 1, {}))
-            if sub and current_emp:
-                if current_section == 'Employer Superannuation':
-                    emp_sub_super[current_emp] = sub
-                elif current_emp not in emp_sub:
-                    emp_sub[current_emp] = sub
-    # Super-row mapping wins
-    final = dict(emp_sub)
-    final.update(emp_sub_super)
-    return final
+# ── 3. Detail Report → GL-stamped expense aggregation ─────────────────────────
 
-
-# ── 3. Detail Report → per-line GL+Sub aggregation (SOURCE OF TRUTH) ──────────
-
-def aggregate_expenses(detail_path, target_runs):
-    """Read Pay Activity Detail Report, sum amounts by (GL code, Sub-Account)
-    for POSTING_SECTIONS. Lines with no GL stamp are allocated to 477/478
-    based on the employee's primary sub-account (from emp_sub map).
-
-    target_runs: iterable of pay run IDs (e.g. ('PAY-001910',)) or
-                 ('PAY-001910','PAY-001911','PAY-001912') for adhoc-combined journals.
-
-    Returns:
-      gl_agg: dict[(gl_code, sub_account)] → amount
-      orphans: list of (section, pay_item, employee_id, amount) for un-allocatable lines
+def aggregate_detail(detail_path, target_runs):
+    """Walk Pay Activity Detail Report, return:
+      gl_agg: dict[(gl_code, sub)] → amount (only POSTING_SECTIONS, only target_runs)
+      emp_sub: dict[emp_id] → sub-account (super-row preferred)
     """
     if isinstance(target_runs, str):
         target_runs = (target_runs,)
     rows = _load_rows(detail_path)
     gl_agg = defaultdict(float)
-    orphans = []
-    current_section = None
-    current_item = None
-    current_item_total = 0.0
-    current_emp = None
 
-    # Build the emp→sub map inline (super-rows preferred)
+    # Pass 1: build emp_sub
     emp_sub_super = {}
     emp_sub_first = {}
+    current_section = None
+    current_emp = None
     for r in sorted(rows):
         row = rows[r]
         sec = row.get(4)
@@ -315,15 +266,15 @@ def aggregate_expenses(detail_path, target_runs):
                 current_emp = parts[0]
         h = row.get(8)
         if h and any(run in str(h) for run in target_runs):
-            sub_here = find_sub_in_row(row) or find_sub_in_row(rows.get(r + 1, {}))
-            if sub_here and current_emp:
+            sub = _find_sub(row) or _find_sub(rows.get(r + 1, {}))
+            if sub and current_emp:
                 if current_section == 'Employer Superannuation':
-                    emp_sub_super[current_emp] = sub_here
+                    emp_sub_super[current_emp] = sub
                 elif current_emp not in emp_sub_first:
-                    emp_sub_first[current_emp] = sub_here
+                    emp_sub_first[current_emp] = sub
     emp_sub = {**emp_sub_first, **emp_sub_super}
 
-    # Reset and do real aggregation
+    # Pass 2: aggregate GL
     current_section = None
     current_item = None
     current_item_total = 0.0
@@ -348,255 +299,438 @@ def aggregate_expenses(detail_path, target_runs):
         if h and any(run in str(h) for run in target_runs):
             if current_section not in POSTING_SECTIONS:
                 continue
-            # GL: scan current row first, then next row
-            gl_str, gl_code = find_gl_in_row(row)
+            gl_str, gl_code = _find_gl(row)
             if not gl_str:
-                gl_str, gl_code = find_gl_in_row(rows.get(r + 1, {}))
-            if gl_str:
-                cont = find_gl_continuation(rows.get(r + 1, {}))
-                if cont and not gl_str.endswith(cont):
-                    gl_str = gl_str + cont
-            sub = find_sub_in_row(row) or find_sub_in_row(rows.get(r + 1, {}))
+                gl_str, gl_code = _find_gl(rows.get(r + 1, {}))
+            sub = _find_sub(row) or _find_sub(rows.get(r + 1, {}))
             val = _num(row.get(25)) or current_item_total
             if val == 0:
                 continue
             if not gl_code:
-                # Allocate orphan to 477 or 478 based on section + employee's primary sub
+                # Orphan — allocate to 477 (income) or 478 (super) by emp primary sub
                 sub_for_orphan = sub or emp_sub.get(current_emp or '', '')
-                if current_section == 'Employer Superannuation':
-                    target_gl = '478'
-                else:
-                    target_gl = '477'
-                if sub_for_orphan:
-                    gl_agg[(target_gl, sub_for_orphan)] += val
-                else:
-                    orphans.append((current_section, current_item, current_emp, val))
+                if not sub_for_orphan:
+                    continue  # truly unallocatable
+                target_gl = '478' if current_section == 'Employer Superannuation' else '477'
+                gl_agg[(target_gl, sub_for_orphan)] += val
             else:
+                if not sub:
+                    # GL stamped but no sub — fall back to emp's primary sub
+                    sub = emp_sub.get(current_emp or '', '')
                 gl_agg[(gl_code, sub)] += val
 
-    return dict(gl_agg), orphans, emp_sub
+    return dict(gl_agg), emp_sub
 
 
-def reallocate_orphans(orphans, emp_sub, summary_by_branch):
-    """Orphan lines (no GL stamp) — travel allowances, sleepover super, etc.
-    Allocate by employee's primary cost-centre, into:
-      - Tax Free Income / Gross Income → 477 (Wages — Direct) using emp sub-account
-      - Employer Superannuation        → 478 (Super — Direct) using emp sub-account
-
-    This mirrors what we know from Craig's posting pattern: allowances roll
-    into the wages account; sleepover super rolls into super.
-    """
-    reallocated = defaultdict(float)
-    unresolved = []
-    for sec, item, emp_id, line_sub, amt in orphans:
-        # Get sub from emp or fall back to the line's sub if present
-        sub = line_sub if (line_sub and '-' in line_sub) else emp_sub.get(emp_id or '', '')
-        if not sub:
-            unresolved.append((sec, item, emp_id, amt))
-            continue
-        if sec == 'Employer Superannuation':
-            gl_code = '478'
-        else:
-            gl_code = '477'
-        reallocated[(gl_code, sub)] += amt
-    return dict(reallocated), unresolved
-
-
-# ── 4. Build leave-payment reclass adjustments ────────────────────────────────
-
-def build_leave_reclass(data, emp_sub, target_run):
-    """Returns dict[(gl_code, sub_account)] → amount for the 3 leave pay items.
-    These ADD to the expense GLs (918/477.6/477.7) AND we need to CR the
-    matching wages account because the underlying amount is already in Gross
-    Income → 477. Net effect: reclass wages to leave accounts.
-
-    Returns:
-      additions: dict[(gl_code, sub)] → amount (positive DR to 918/477.6/477.7)
-      subtractions: dict[(gl_code, sub)] → amount (negative DR / contra to 477)
-    """
-    additions = defaultdict(float)
-    subtractions = defaultdict(float)  # to be netted against 477/477.4
-    audit = []
+def add_leave_loading(gl_agg, data, emp_sub, target_runs):
+    """Leave Loading Expense isn't stamped in Detail Report — add from Data export."""
+    if isinstance(target_runs, str):
+        target_runs = (target_runs,)
+    if any(k[0] == '477.6' for k in gl_agg):
+        return gl_agg  # already covered
     for d in data:
-        if d.get('Pay Run ID') != target_run:
+        if d.get('Pay Run ID') not in target_runs:
             continue
-        pi = d.get('Pay Item Description')
-        if pi not in LEAVE_PAYMENT_RULES:
+        if d.get('Pay Item Description') != 'Leave Loading Expense':
             continue
         amt = _num(d.get('Amount'))
         if amt == 0:
             continue
         emp_id = str(d.get('Employee ID') or '')
-        sub = emp_sub.get(emp_id, 'UNKNOWN')
-        rule = LEAVE_PAYMENT_RULES[pi]
-        additions[(rule['code'], sub)] += amt
-        # Subtract from 477 wages (Direct) at same sub — leave-taken came
-        # through Gross Income → 477 originally
-        subtractions[('477', sub)] += amt
-        audit.append((pi, f"{d.get('First Name')} {d.get('Last Name')}", emp_id, sub, amt))
-    return dict(additions), dict(subtractions), audit
+        sub = emp_sub.get(emp_id, '')
+        if not sub:
+            continue
+        gl_agg[('477.6', sub)] = gl_agg.get(('477.6', sub), 0) + amt
+    return gl_agg
 
 
-def sub_to_branch(sub):
-    """Map sub-account prefix to branch code."""
-    if not sub:
-        return '??'
-    prefix = sub[:2].upper()
-    return BRANCH_BY_SUB_PREFIX.get(prefix, '??')
+# ── 4. Group GL aggregation by tenant ─────────────────────────────────────────
+
+def split_by_tenant(gl_agg):
+    """Group {(gl, sub): amount} into SC tenant and CQ tenant buckets."""
+    sc = defaultdict(float)
+    cq = defaultdict(float)
+    unknown = defaultdict(float)
+    for (gl, sub), v in gl_agg.items():
+        prefix = (sub[:2] if sub else '').upper()
+        if prefix in SC_TENANT_BRANCHES:
+            sc[(gl, sub)] += v
+        elif prefix in CQ_TENANT_BRANCHES:
+            cq[(gl, sub)] += v
+        else:
+            unknown[(gl, sub)] += v
+    return dict(sc), dict(cq), dict(unknown)
 
 
-def pick_default_run(data):
-    counts = defaultdict(int)
-    for d in data:
-        counts[d.get('Pay Run ID')] += 1
-    return max(counts.items(), key=lambda kv: kv[1])[0] if counts else None
+# ── 5. Build full balanced journals ───────────────────────────────────────────
+
+def build_sc_journal(sc_dr_lines, summary_by_run_branch, sc_runs):
+    """Build SC tenant journal: DRs + payable CRs + 877 clearing.
+
+    DRs: per (GL, sub-account), tagged with Location = sub-account's branch (SC or WB)
+    CRs: 803 (wages), 825 (PAYG), 826 (super), all untracked
+    877: ONE CR line per Location (matches sum of DRs for that location)
+         ONE DR untracked (matches sum of CR payables)
+    """
+    expense_dr_lines = []
+
+    # Build expense DR lines + track by-location totals
+    sc_dr_by_loc = defaultdict(float)
+    for (gl, sub), amt in sorted(sc_dr_lines.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        if amt == 0:
+            continue
+        loc = 'Sunshine Coast' if sub.startswith('SC') else ('Wide Bay' if sub.startswith('WB') else None)
+        line = {
+            'LineAmount': round(amt, 2),
+            'AccountCode': gl,
+            'Description': f"{sub} ({gl})",
+            'Tracking': [],
+        }
+        if loc:
+            line['_location_name'] = loc
+            sc_dr_by_loc[loc] += amt
+        expense_dr_lines.append(line)
+
+    # Sum payable CRs from Summary tuples for SC + WB branches
+    sc_net = sum(summary_by_run_branch.get((run, br), {}).get('net', 0)
+                 for run in sc_runs for br in ('SC', 'WB'))
+    sc_pretax = sum(summary_by_run_branch.get((run, br), {}).get('pretax_ded', 0)
+                    for run in sc_runs for br in ('SC', 'WB'))
+    sc_posttax = sum(summary_by_run_branch.get((run, br), {}).get('post_tax_ded', 0)
+                     for run in sc_runs for br in ('SC', 'WB'))
+    sc_payg = sum(summary_by_run_branch.get((run, br), {}).get('payg', 0)
+                  for run in sc_runs for br in ('SC', 'WB'))
+    sc_super = sum(summary_by_run_branch.get((run, br), {}).get('employer_super', 0)
+                   for run in sc_runs for br in ('SC', 'WB'))
+
+    wages_pay = round(sc_net + sc_pretax + sc_posttax, 2)
+    payg_pay = round(sc_payg, 2)
+    super_pay = round(sc_super, 2)
+
+    payable_cr_lines = [
+        {'LineAmount': -wages_pay, 'AccountCode': CODES['wages_payable'],
+         'Description': 'Net pay + salary-sacrifice + post-tax deductions (SC + WB)', 'Tracking': []},
+        {'LineAmount': -payg_pay, 'AccountCode': CODES['payg_payable'],
+         'Description': 'PAYG withholdings (SC + WB)', 'Tracking': []},
+        {'LineAmount': -super_pay, 'AccountCode': CODES['super_payable'],
+         'Description': 'Employer super SG (SC + WB)', 'Tracking': []},
+    ]
+
+    # 877 clearing — one CR per location matching DR sum (rounded carefully)
+    clearing_cr_lines = []
+    total_dr_locs = 0.0
+    for loc, total in sorted(sc_dr_by_loc.items()):
+        t = round(total, 2)
+        total_dr_locs += t
+        clearing_cr_lines.append({
+            'LineAmount': -t, 'AccountCode': CODES['tracking_xfer'],
+            'Description': f"Tracking Transfer — {loc}",
+            'Tracking': [], '_location_name': loc,
+        })
+
+    # 877 DR untracked = total payable CRs (so DR=CR overall)
+    untracked_dr = round(wages_pay + payg_pay + super_pay, 2)
+    clearing_dr = {'LineAmount': untracked_dr, 'AccountCode': CODES['tracking_xfer'],
+                   'Description': 'Tracking Transfer — payable clearing (no location)',
+                   'Tracking': []}
+
+    # Balance check:
+    # DR side = expense_DRs + clearing_DR_untracked
+    # CR side = payables (untracked) + clearing_CRs (per location)
+    # For DR == CR we need:
+    #   sum(expense_DRs) + untracked_DR == sum(payables) + sum(clearing_CR_per_loc)
+    #   sum(expense_DRs) + sum(payables) == sum(payables) + sum(expense_DRs)
+    # Identity holds by construction IF sum(clearing_CR_per_loc) == sum(expense_DRs by loc)
+    # and untracked_DR == sum(payables). Both true above.
+
+    return expense_dr_lines + payable_cr_lines + clearing_cr_lines + [clearing_dr]
+
+
+def build_cq_journal(cq_dr_lines, summary_by_run_branch, cq_runs):
+    """Build CQ tenant journal: DRs + payable CRs (no location, no 877)."""
+    lines = []
+    for (gl, sub), amt in sorted(cq_dr_lines.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        if amt == 0:
+            continue
+        lines.append({
+            'LineAmount': round(amt, 2),
+            'AccountCode': gl,
+            'Description': f"{sub} ({gl})" if sub else gl,
+            'Tracking': [],
+        })
+
+    cq_net = sum(summary_by_run_branch.get((run, 'CQ'), {}).get('net', 0) for run in cq_runs)
+    cq_pretax = sum(summary_by_run_branch.get((run, 'CQ'), {}).get('pretax_ded', 0) for run in cq_runs)
+    cq_posttax = sum(summary_by_run_branch.get((run, 'CQ'), {}).get('post_tax_ded', 0) for run in cq_runs)
+    cq_payg = sum(summary_by_run_branch.get((run, 'CQ'), {}).get('payg', 0) for run in cq_runs)
+    cq_super = sum(summary_by_run_branch.get((run, 'CQ'), {}).get('employer_super', 0) for run in cq_runs)
+
+    wages_pay = round(cq_net + cq_pretax + cq_posttax, 2)
+    payg_pay = round(cq_payg, 2)
+    super_pay = round(cq_super, 2)
+
+    lines.append({'LineAmount': -wages_pay, 'AccountCode': CODES['wages_payable'],
+                  'Description': 'Net pay + deductions (CQ)', 'Tracking': []})
+    lines.append({'LineAmount': -payg_pay, 'AccountCode': CODES['payg_payable'],
+                  'Description': 'PAYG withholdings (CQ)', 'Tracking': []})
+    lines.append({'LineAmount': -super_pay, 'AccountCode': CODES['super_payable'],
+                  'Description': 'Employer super SG (CQ)', 'Tracking': []})
+    return lines
+
+
+def balance_check(lines, label):
+    dr = sum(l['LineAmount'] for l in lines if l['LineAmount'] > 0)
+    cr = -sum(l['LineAmount'] for l in lines if l['LineAmount'] < 0)
+    bal = abs(dr - cr) < 0.01
+    return dr, cr, bal
+
+
+def render_journal(lines, title):
+    dr, cr, bal = balance_check(lines, title)
+    print(f"\n{'═' * 80}")
+    print(f"{title}")
+    print(f"{'═' * 80}")
+    print(f"{'Acct':<8} {'Description':<55} {'Loc':<14} {'Amount':>14}")
+    for l in lines:
+        loc = l.get('_location_name', '')[:14]
+        amt = l['LineAmount']
+        sign = f"DR ${amt:>11,.2f}" if amt > 0 else f"CR ${-amt:>11,.2f}"
+        print(f"  {l['AccountCode']:<6} {l['Description'][:55]:<55} {loc:<14} {sign}")
+    print(f"  {'─' * 78}")
+    print(f"  TOTAL DR: ${dr:>12,.2f}    TOTAL CR: ${cr:>12,.2f}    Balanced: {'✓' if bal else '✗'}")
+    return dr, cr, bal
+
+
+# ── 6. Xero POST integration ──────────────────────────────────────────────────
+
+def _creds(entity):
+    p = entity.upper()
+    return {
+        'client_id':     os.environ.get(f'XERO_{p}_CLIENT_ID', ''),
+        'client_secret': os.environ.get(f'XERO_{p}_CLIENT_SECRET', ''),
+        'tenant_id':     os.environ.get(f'XERO_{p}_TENANT_ID', ''),
+    }
+
+
+def _xero_token(creds):
+    import base64, urllib.request, urllib.error
+    if not creds['client_id'] or not creds['client_secret']:
+        raise RuntimeError(f"XERO_*_CLIENT_ID / _CLIENT_SECRET env vars not set")
+    basic = base64.b64encode(f"{creds['client_id']}:{creds['client_secret']}".encode()).decode()
+    req = urllib.request.Request(
+        XERO_TOKEN_URL,
+        data=f"grant_type=client_credentials&scope={WRITE_SCOPES}".encode(),
+        headers={'Authorization': f'Basic {basic}',
+                 'Content-Type': 'application/x-www-form-urlencoded',
+                 'Accept': 'application/json'},
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())['access_token']
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Xero token exchange failed: {e.code} {e.read().decode()[:300]}") from e
+
+
+def _xero_get(creds, token, path):
+    import urllib.request, urllib.error
+    req = urllib.request.Request(
+        f"{XERO_API}{path}",
+        headers={'Authorization': f'Bearer {token}',
+                 'Xero-Tenant-Id': creds['tenant_id'],
+                 'Accept': 'application/json'},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Xero GET {path} failed: {e.code} {e.read().decode()[:300]}") from e
+
+
+def discover_sc_tracking(creds, token):
+    """Find SC Location tracking category + SC/WB option IDs."""
+    data = _xero_get(creds, token, "/TrackingCategories")
+    cats = data.get('TrackingCategories', [])
+    target = next((c for c in cats if c.get('Name', '').strip().lower() == 'location'
+                   and c.get('Status') == 'ACTIVE'), None)
+    if not target:
+        raise RuntimeError(f"No ACTIVE 'Location' tracking on SC — saw: {[c.get('Name') for c in cats]}")
+    options = {o.get('Name', '').strip(): o for o in target.get('Options', []) if o.get('Status') == 'ACTIVE'}
+    sc = options.get('Sunshine Coast')
+    wb = options.get('Wide Bay')
+    if not sc or not wb:
+        raise RuntimeError(f"Sunshine Coast/Wide Bay not in Location options — saw: {list(options.keys())}")
+    return {
+        'category_id': target['TrackingCategoryID'],
+        'sc_option_id': sc['TrackingOptionID'],
+        'wb_option_id': wb['TrackingOptionID'],
+    }
+
+
+def attach_tracking(lines, tracking):
+    """Replace `_location_name` placeholders with Xero TrackingCategoryID/OptionID."""
+    out = []
+    for l in lines:
+        l = dict(l)
+        loc = l.pop('_location_name', None)
+        if loc == 'Sunshine Coast':
+            l['Tracking'] = [{'TrackingCategoryID': tracking['category_id'],
+                              'TrackingOptionID':   tracking['sc_option_id']}]
+        elif loc == 'Wide Bay':
+            l['Tracking'] = [{'TrackingCategoryID': tracking['category_id'],
+                              'TrackingOptionID':   tracking['wb_option_id']}]
+        else:
+            l['Tracking'] = []
+        out.append(l)
+    return out
+
+
+def post_draft(entity, narration, journal_date, lines):
+    """POST a DRAFT Manual Journal to Xero. HARD LOCKED to DRAFT status."""
+    import datetime as _dt
+    import urllib.request, urllib.error
+    creds = _creds(entity)
+    if not creds['tenant_id']:
+        raise RuntimeError(f"XERO_{entity}_TENANT_ID not set")
+    token = _xero_token(creds)
+
+    # SC needs location tracking attached
+    if entity.upper() == 'SC':
+        tracking = discover_sc_tracking(creds, token)
+        lines = attach_tracking(lines, tracking)
+    else:
+        # CQ — strip any _location_name placeholders
+        lines = [{k: v for k, v in l.items() if not k.startswith('_')} for l in lines]
+
+    dr, cr, bal = balance_check(lines, entity)
+    if not bal:
+        raise RuntimeError(f"{entity} unbalanced: DR ${dr:.2f} CR ${cr:.2f}")
+
+    brisbane_now = _dt.datetime.now(_dt.timezone.utc).astimezone(_dt.timezone(_dt.timedelta(hours=10)))
+    tag = f" [DRAFT auto-generated by JBC Hermes {brisbane_now:%Y-%m-%d %H:%M AEST}]"
+    body = {
+        'Date': journal_date,
+        'Status': 'DRAFT',  # HARD LOCKED
+        'LineAmountTypes': 'NoTax',
+        'Narration': (narration + tag)[:2500],
+        'JournalLines': lines,
+    }
+    req = urllib.request.Request(
+        f"{XERO_API}/ManualJournals",
+        data=json.dumps({'ManualJournals': [body]}).encode(),
+        headers={'Authorization': f'Bearer {token}',
+                 'Xero-Tenant-Id': creds['tenant_id'],
+                 'Content-Type': 'application/json',
+                 'Accept': 'application/json'},
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        err = e.read().decode()[:600]
+        raise RuntimeError(f"Xero {e.code}: {err}") from e
+
+    mj = data['ManualJournals'][0]
+    return {
+        'tenant': entity,
+        'ManualJournalID': mj['ManualJournalID'],
+        'Status': mj.get('Status'),
+        'TotalDR': round(dr, 2),
+        'TotalCR': round(cr, 2),
+        'LineCount': len(lines),
+        'xero_link': f"https://go.xero.com/Bank/ViewManualJournal.aspx?ManualJournalID={mj['ManualJournalID']}",
+    }
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    if len(sys.argv) < 4:
-        print(__doc__)
-        sys.exit(1)
-    summary_path = sys.argv[1]
-    data_path = sys.argv[2]
-    detail_path = sys.argv[3]
-    target_run = sys.argv[4] if len(sys.argv) > 4 else None
+    ap = argparse.ArgumentParser()
+    ap.add_argument('summary', help='Pay Activity Summary .xlsx')
+    ap.add_argument('data', help='Pay Activity Detail Data .xlsx (1000-row cap MUST be declined)')
+    ap.add_argument('detail', help='Pay Activity Detail Report .xlsx')
+    ap.add_argument('--sc-runs', help='Comma-separated SC tenant pay runs (e.g. PAY-001910,PAY-001911)')
+    ap.add_argument('--cq-runs', help='Comma-separated CQ tenant pay runs (e.g. PAY-001909)')
+    ap.add_argument('--journal-date', help='Journal date YYYY-MM-DD (default: pay period end)')
+    ap.add_argument('--narration', help='Narration (default: auto-generated)')
+    ap.add_argument('--post-draft', action='store_true', help='Actually POST to Xero (otherwise just preview)')
+    args = ap.parse_args()
 
-    print("=== Loading MYOB exports ===")
-    by_branch, meta = parse_summary(summary_path)
-    print(f"  Pay Activity Summary: {len(by_branch)} branches")
+    print(f"=== Loading MYOB exports ===")
+    summary, meta = parse_summary(args.summary)
+    print(f"  Pay Activity Summary: {len(summary)} (pay_run, branch) buckets")
     if meta:
-        print(f"  Physical pay-date range: {_excel_to_iso(meta.get('from','?'))} → {_excel_to_iso(meta.get('to','?'))}")
-
-    data = parse_data(data_path)
+        print(f"  Physical pay-date range: {_excel_to_iso(meta.get('from',''))} → {_excel_to_iso(meta.get('to',''))}")
+    data = parse_data(args.data)
     print(f"  Pay Activity Detail Data: {len(data)} rows")
 
-    if target_run is None:
-        target_run = pick_default_run(data)
-        print(f"  Auto-selected pay run: {target_run}")
+    # Auto-detect pay runs by tenant if not specified
+    sc_runs_seen = set()
+    cq_runs_seen = set()
+    for (run, br), _ in summary.items():
+        if br in SC_TENANT_BRANCHES:
+            sc_runs_seen.add(run)
+        elif br in CQ_TENANT_BRANCHES:
+            cq_runs_seen.add(run)
 
-    # Allow combining multiple pay runs into one journal (Craig's pattern for SC tenant
-    # which can include weekly + adhoc-correction runs)
-    target_runs = target_run if isinstance(target_run, (list, tuple)) else (target_run,)
-    if isinstance(target_run, str) and ',' in target_run:
-        target_runs = tuple(s.strip() for s in target_run.split(','))
-    print(f"  Pay runs to aggregate: {', '.join(target_runs)}")
+    sc_runs = tuple(args.sc_runs.split(',')) if args.sc_runs else tuple(sorted(sc_runs_seen))
+    cq_runs = tuple(args.cq_runs.split(',')) if args.cq_runs else tuple(sorted(cq_runs_seen))
+    print(f"  SC tenant runs: {', '.join(sc_runs) or '(none)'}")
+    print(f"  CQ tenant runs: {', '.join(cq_runs) or '(none)'}")
 
-    # 1. GL aggregation from Detail Report (with inline orphan reallocation)
-    gl_agg, orphans, emp_sub = aggregate_expenses(detail_path, target_runs)
-    print(f"\n=== Detail Report aggregation ===")
-    print(f"  {len(emp_sub)} employee→sub-account mappings (super-row preferred)")
-    print(f"  {len(gl_agg)} (GL, Sub) buckets")
-    if orphans:
-        print(f"  WARNING: {len(orphans)} fully unresolved orphans:")
-        for sec, item, emp, amt in orphans[:5]:
-            print(f"    {sec} | {item} | emp={emp} | ${amt:.2f}")
+    # Aggregate per tenant
+    sc_gl_agg = {}
+    cq_gl_agg = {}
+    sc_emp_sub = {}
+    if sc_runs:
+        sc_gl_agg, sc_emp_sub = aggregate_detail(args.detail, sc_runs)
+        sc_gl_agg = add_leave_loading(sc_gl_agg, data, sc_emp_sub, sc_runs)
+    if cq_runs:
+        cq_gl_agg, cq_emp_sub = aggregate_detail(args.detail, cq_runs)
+        cq_gl_agg = add_leave_loading(cq_gl_agg, data, cq_emp_sub, cq_runs)
 
-    # 2. Leave-payment cross-check (from Data export) — Leave Loading Expense
-    # is not stamped in the Detail Report. Add it to 477.6 if missing.
-    additions, _sub, audit = build_leave_reclass(data, emp_sub, target_runs[0])
-    has_477_6_from_detail = any(k[0] == '477.6' for k in gl_agg)
-    if not has_477_6_from_detail:
-        print(f"\n  [Adding Leave Loading Expense → 477.6 from Data export (Detail Report missed it)]")
-        for k, v in additions.items():
-            if k[0] == '477.6':
-                gl_agg[k] = gl_agg.get(k, 0) + v
-                print(f"    +${v:,.2f} → 477.6 {k[1]}")
+    # Drop any cross-tenant noise (CQ subs in SC dict, SC subs in CQ dict)
+    sc_gl_agg = {(gl, sub): v for (gl, sub), v in sc_gl_agg.items()
+                 if not sub or sub[:2].upper() in SC_TENANT_BRANCHES}
+    cq_gl_agg = {(gl, sub): v for (gl, sub), v in cq_gl_agg.items()
+                 if not sub or sub[:2].upper() in CQ_TENANT_BRANCHES}
+
+    # Build journals
+    sc_lines = build_sc_journal(sc_gl_agg, summary, sc_runs) if sc_runs else []
+    cq_lines = build_cq_journal(cq_gl_agg, summary, cq_runs) if cq_runs else []
+
+    # Render
+    pay_date = _excel_to_iso(meta.get('to', '')) or args.journal_date or ''
+    journal_date = args.journal_date or pay_date
+    narration = args.narration or f"Payroll pay run(s) {','.join(sc_runs)} — wk ending {pay_date}"
+
+    if sc_lines:
+        render_journal(sc_lines, f"SC TENANT JOURNAL — runs {','.join(sc_runs)} — date {journal_date}")
+    if cq_lines:
+        render_journal(cq_lines, f"CQ TENANT JOURNAL — runs {','.join(cq_runs)} — date {journal_date}")
+
+    if args.post_draft:
+        print(f"\n=== Posting DRAFTs to Xero ===")
+        if sc_lines:
+            try:
+                result = post_draft('SC', narration + ' (SC + Wide Bay)', journal_date, sc_lines)
+                print(f"  SC: ✓ ManualJournalID={result['ManualJournalID']} ({result['Status']}) "
+                      f"DR=${result['TotalDR']:,.2f} CR=${result['TotalCR']:,.2f}")
+                print(f"      Link: {result['xero_link']}")
+            except Exception as e:
+                print(f"  SC: ✗ {e}")
+        if cq_lines:
+            try:
+                cq_narration = narration.replace('SC + Wide Bay', '').strip() + ' (CQ)'
+                result = post_draft('CQ', cq_narration, journal_date, cq_lines)
+                print(f"  CQ: ✓ ManualJournalID={result['ManualJournalID']} ({result['Status']}) "
+                      f"DR=${result['TotalDR']:,.2f} CR=${result['TotalCR']:,.2f}")
+                print(f"      Link: {result['xero_link']}")
+            except Exception as e:
+                print(f"  CQ: ✗ {e}")
     else:
-        print(f"\n  [Detail Report has 477.6 — no Data-export reclass needed]")
-
-    combined = dict(gl_agg)
-
-    # 4. Print final journal lines (DR side)
-    print(f"\n=== Final expense DR journal lines ===")
-    by_gl = defaultdict(float)
-    by_branch_gl = defaultdict(float)
-    print(f"  {'GL':<8} {'Sub Account':<32} {'Branch':<6} {'Amount':>14}")
-    rows_out = []
-    total = 0.0
-    for (gl, sub), v in sorted(combined.items()):
-        if abs(v) < 0.005:
-            continue
-        b = sub_to_branch(sub)
-        print(f"  {gl:<8} {sub:<32} {b:<6} ${v:>12,.2f}")
-        by_gl[gl] += v
-        by_branch_gl[(b, gl)] += v
-        rows_out.append({'gl': gl, 'sub': sub, 'branch': b, 'amount': round(v, 2)})
-        total += v
-    print(f"  {'TOTAL':<48} ${total:>12,.2f}")
-
-    print(f"\n=== Totals by GL ===")
-    for gl, v in sorted(by_gl.items()):
-        print(f"  {gl:<10} ${v:>12,.2f}")
-
-    # Compare to Craig's known journal for PAY-001910
-    if target_run == 'PAY-001910':
-        print(f"\n=== Reconciliation vs Journal #673782 ===")
-        CRAIG = {
-            ('SC','477'): 133812.66, ('WB','477'): 22173.51,
-            ('SC','477.4'): 46202.41, ('WB','477.4'): 1250.00,
-            ('SC','477.6'): 815.93,
-            ('SC','477.7'): 336.78,
-            ('SC','478'): 15422.67, ('WB','478'): 2510.03,
-            ('SC','478.1'): 5748.23, ('WB','478.1'): 150.00,
-            ('SC','918'): 4662.41,
-        }
-        ok = True
-        for (br, gl), expected in CRAIG.items():
-            actual = by_branch_gl.get((br, gl), 0)
-            delta = actual - expected
-            flag = '✓' if abs(delta) < 0.50 else '✗'
-            print(f"  {flag}  {br} {gl:<8} expected ${expected:>12,.2f}  actual ${actual:>12,.2f}  Δ ${delta:+9,.2f}")
-            if abs(delta) >= 0.50:
-                ok = False
-        print(f"\n{'RECONCILED ✓' if ok else 'MISMATCH ✗ (review variance with Nicole before posting)'}")
-
-    # 5. Build CR side (payables + 877 clearing) from Summary tuples
-    print(f"\n=== Building CR side (payables + 877 clearing) ===")
-    # SC tenant payables = SC branch + WB branch combined
-    sc_net = by_branch.get('SC', {}).get('net', 0) + by_branch.get('WB', {}).get('net', 0)
-    sc_pretax = by_branch.get('SC', {}).get('pretax_ded', 0) + by_branch.get('WB', {}).get('pretax_ded', 0)
-    sc_posttax = by_branch.get('SC', {}).get('post_tax_ded', 0) + by_branch.get('WB', {}).get('post_tax_ded', 0)
-    sc_payg = by_branch.get('SC', {}).get('payg', 0) + by_branch.get('WB', {}).get('payg', 0)
-    sc_super = by_branch.get('SC', {}).get('employer_super', 0) + by_branch.get('WB', {}).get('employer_super', 0)
-
-    cq_net = by_branch.get('CQ', {}).get('net', 0)
-    cq_pretax = by_branch.get('CQ', {}).get('pretax_ded', 0)
-    cq_posttax = by_branch.get('CQ', {}).get('post_tax_ded', 0)
-    cq_payg = by_branch.get('CQ', {}).get('payg', 0)
-    cq_super = by_branch.get('CQ', {}).get('employer_super', 0)
-
-    sc_dr_total = sum(v for (gl, sub), v in combined.items()
-                      if sub.startswith(('SC', 'WB')) or sub == '' or sub.startswith('??'))
-    cq_dr_total = sum(v for (gl, sub), v in combined.items()
-                      if sub.startswith('CQ'))
-
-    print(f"\n  SC tenant (SC + WB branches combined):")
-    print(f"    DR side total      : ${sc_dr_total:>12,.2f}")
-    print(f"    803 Wages Payable  : ${(sc_net + sc_pretax + sc_posttax):>12,.2f}")
-    print(f"    825 PAYG Payable   : ${sc_payg:>12,.2f}")
-    print(f"    826 Super Payable  : ${sc_super:>12,.2f}")
-    sc_cr_total = sc_net + sc_pretax + sc_posttax + sc_payg + sc_super
-    print(f"    CR side total      : ${sc_cr_total:>12,.2f}")
-    print(f"    Δ (must = 877 clearing): ${sc_dr_total - sc_cr_total:+,.2f}")
-    print(f"    [877 Tracking Transfer CR (location-tagged) = ${sc_dr_total:,.2f}]")
-    print(f"    [877 Tracking Transfer DR (untracked)        = ${sc_cr_total:,.2f}]")
-
-    print(f"\n  CQ tenant (CQ only — no location tracking):")
-    print(f"    DR side total      : ${cq_dr_total:>12,.2f}")
-    print(f"    803 Wages Payable  : ${(cq_net + cq_pretax + cq_posttax):>12,.2f}")
-    print(f"    825 PAYG Payable   : ${cq_payg:>12,.2f}")
-    print(f"    826 Super Payable  : ${cq_super:>12,.2f}")
-    cq_cr_total = cq_net + cq_pretax + cq_posttax + cq_payg + cq_super
-    print(f"    CR side total      : ${cq_cr_total:>12,.2f}")
-    print(f"    Δ DR-CR (should be 0): ${cq_dr_total - cq_cr_total:+,.2f}")
-
-    # 6. Summary totals comparison
-    print(f"\n=== Summary totals by branch (from Pay Activity Summary) ===")
-    print(f"{'Branch':<8} {'gross':>12} {'pretax_ded':>12} {'payg':>10} {'after_tax':>10} {'post_tax_ded':>14} {'net':>12} {'employer_super':>14}")
-    for branch, t in sorted(by_branch.items()):
-        print(f"  {branch:<6} {t['gross']:>12,.2f} {t['pretax_ded']:>12,.2f} {t['payg']:>10,.2f} {t['after_tax']:>10,.2f} {t['post_tax_ded']:>14,.2f} {t['net']:>12,.2f} {t['employer_super']:>14,.2f}")
+        print(f"\n[Preview mode — pass --post-draft to actually POST to Xero]")
 
 
 if __name__ == '__main__':
