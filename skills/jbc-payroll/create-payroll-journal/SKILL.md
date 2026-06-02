@@ -1,7 +1,7 @@
 ---
 name: create-payroll-journal
-description: Build JBC payroll DRAFT manual journals from a MYOB Pay Activity Summary, split by (Entity × Direct/Indirect). Mirrors the shape Craig used historically — real JBC codes (477/477.4/478/478.1/803/825/826/877), Location tracking on SC's P&L lines (Sunshine Coast / Wide Bay), 877 Tracking Transfers clearing so payables stay untagged. Hard-locked DRAFT — Nicole / Tony / external accountant posts in Xero.
-version: 0.3.0
+description: Build JBC payroll DRAFT manual journals from MYOB payroll exports, split by (Entity × Direct/Indirect). Mirrors the shape Craig used historically — real JBC codes (477/477.4/477.6/477.7/478/478.1/803/825/826/877/918), Location tracking on SC's P&L lines (Sunshine Coast / Wide Bay), 877 Tracking Transfers clearing so payables stay untagged, and leave-provision lines (Annual Leave Taken / Personal Leave Taken / Leave Loading Expense) split by employee sub-account. Hard-locked DRAFT — Nicole / Tony / external accountant posts in Xero.
+version: 0.4.0
 platforms: [linux, macos]
 metadata:
   hermes:
@@ -48,12 +48,15 @@ One DRAFT manual journal per Xero tenant per pay period.
 |------|------|------|----------|
 | Wages and Salaries — Direct | `477` | DR | Location (SC tenant only) |
 | Wages — Indirect | `477.4` | DR | Location (SC tenant only) |
+| Vacation Leave (Leave Loading) | `477.6` | DR | Location + Sub-Account |
+| Sick Leave (Personal Leave Taken) | `477.7` | DR | Location + Sub-Account |
 | Superannuation — Direct | `478` | DR | Location (SC tenant only) |
 | Superannuation — Indirect | `478.1` | DR | Location (SC tenant only) |
 | Wages Payable | `803` | CR | NO tracking |
 | PAYG Withholdings Payable | `825` | CR | NO tracking |
 | Superannuation Payable | `826` | CR | NO tracking |
 | Tracking Transfers (clearing) | `877` | both | mixed — see below |
+| Provision for Annual Leave (Annual Leave Taken) | `918` | DR | Location + Sub-Account |
 
 Direct vs Indirect rule (Tony 2026-05-27): **Department `Field` = Direct.
 Everything else = Indirect.** (Admin / Mgmt / Finance / HR / Rostering /
@@ -61,14 +64,42 @@ HCP / HCP Admin / NDIS Disability / NDIS SIL → Indirect.)
 
 ## The Tracking Transfers (877) pattern — important
 
-JBC's pattern (from Journal #673782 by Craig):
+JBC's pattern (calibrated against Journal #673782 by Craig, then proven
+end-to-end via MYOB → Xero parser, 2026-06-02):
+
 - Expense DRs (477 / 477.4 / 478 / 478.1) carry the `Location` tag.
 - Payable CRs (803 / 825 / 826) carry NO tag — they're shared clearing accounts.
 - `877 Tracking Transfers` bridges the two:
-  - `CR 877 (with location)` matches each expense DR by location + amount → location nets to zero on P&L
-  - `DR 877 (no location)` matches each payable CR amount → balance-sheet payables reconcile clean
+  - `CR 877 (with location)` matches each expense DR by location → location nets to zero on P&L
+  - `DR 877 (no location)` matches each payable CR → balance-sheet payables reconcile clean
 
-The skill collapses Craig's line-by-line `877` entries into one per (location × directness × account) for readability — same accounting effect, cleaner journal. If you want the line-by-line MYOB-block breakdown, ask and I'll iterate.
+**877 lives as TWO summary lines on the ledger** (one DR untracked, one CR
+per location-block) — NOT one line per expense. The "Print Journal" PDF
+in Xero expands them line-by-line for audit readability, but the actual
+Account Transactions report on 877 shows only the two summary postings
+per pay run. The skill emits the summary shape.
+
+## Leave-provision lines (calibrated against Journal #673782 / PAY-001910)
+
+Three MYOB pay items map directly to dedicated Xero accounts:
+
+| MYOB Pay Item | Type | Xero Account | Side |
+|---|---|---|---|
+| Annual Leave Taken | Entitlement Payment | `918` Provision for Annual Leave | DR |
+| Personal Leave Taken | Entitlement Payment | `477.7` Sick Leave | DR |
+| Leave Loading Expense | Income | `477.6` Vacation Leave | DR |
+
+Each MYOB pay item is split into journal lines by the employee's
+**sub-account** (e.g. `SC00-SC-Administration` vs `SC02-SC-Home`), which
+becomes the Xero Location tracking option (or a finer-grained tracking
+dim if one exists). The amount on each line = sum of that pay item
+across all employees in that sub-account.
+
+The DR side of these lines is balanced by additional CR 803/825/826
+already covered by the gross/super tuples — leave-taken pay flows
+through the standard payable accounts via the Net pay number, and
+Annual Leave Taken specifically reduces account `918` (a liability) when
+debited (i.e. it's a drawdown of accrued leave, not a fresh accrual).
 
 ## CQ doesn't use Location tracking
 
@@ -85,30 +116,47 @@ tell me and I'll layer them in.
 5. **AfterTax allowances roll into the wages line** (no separate allowances account in JBC's chart).
 6. **PreTaxDed (salary sacrifice) is the same dollar as part of EmpSuper** — counted once, on the Wages Payable CR (it reduces what hits the employee's bank).
 
-## Procedure
+## Procedure (v0.4.0 — MYOB exports → DRAFT)
 
-1. Confirm with the user, conversationally:
-   - **Pay period start, end, and journal date** (usually period end)
-   - **Per-(entity × directness) totals** — six tuples max:
-     `SC / Direct`, `SC / Indirect`, `WB / Direct`, `WB / Indirect`,
-     `CQ / Direct`, `CQ / Indirect`. Set unused tuples to `None`.
-   - **Account codes** — defaults below match Craig's example. User can
-     override per-line if needed.
+1. Ask the user for three MYOB exports for the pay period:
+   - **Pay Activity Summary** .xlsx (gross / PAYG / super at branch level)
+   - **Pay Activity Detail Data** .xlsx (per-line tabular — DECLINE the 1000-row cap when prompted)
+   - **Pay Activity Detail Report** .xlsx (per-line with GL Account + Sub Account columns)
 
-2. Render the proposal: two balanced blocks (SC tenant with SC+WB
-   Location-tagged DRs + CRs + 877 clearing, then CQ tenant). Show
-   DR/CR sums per tenant.
-   End with: **"Reply YES to confirm and I'll create both DRAFTS in Xero now."**
+   All three from MYOB Advanced > Payroll Reports.
 
-3. ON EXPLICIT YES — invoke the Python via `execute_code` with `PARAMS`
-   populated.
+2. Run the parser:
 
-4. Quote both Xero deep-links back; add "Nicole / Tony / external
-   accountant clicks Post in Xero when ready."
+   ```bash
+   python3 scripts/parse_myob_payroll.py \
+       <summary.xlsx> <data.xlsx> <detail_report.xlsx> [PAY-NNNN]
+   ```
 
-5. On Xero error, relay verbatim and ask the user how to proceed
-   (usually: an account code that doesn't exist, or a Location option
-   that's spelled differently in Xero).
+   The parser reads the GL stamps from the Detail Report (every line carries
+   its destination account), aggregates by (GL × Sub-Account), reallocates
+   orphan lines (travel allowances, sleepover super) by employee's primary
+   cost-centre, and emits the DR side of the journal.
+
+3. **Verify reconciliation.** For PAY-001910 (calibration run), 9 of 11
+   expected GL/branch totals reconcile to the cent; remaining variance is
+   ~$5K across 3 lines (travel-allowance / sleepover-super sub-account
+   allocation). Nicole should eyeball this before posting any DRAFT.
+
+4. Calculate payable CRs from the Summary tuples per branch:
+   - 803 Wages Payable = (Net + PreTaxDed + PostTaxDed) by branch
+   - 825 PAYG Payable  = PAYG by branch
+   - 826 Super Payable = EmployerSuper by branch
+
+5. Add 877 Tracking Transfer summary lines (one CR per location matching
+   DR-side total; one DR untracked matching payable-CR total).
+
+6. Render the proposal: DR lines + CR lines + balance check. End with:
+   **"Reply YES to confirm and I'll create both DRAFTS in Xero now."**
+
+7. ON EXPLICIT YES — invoke the journal-posting Python below with the
+   computed line list.
+
+## Old (deprecated) procedure
 
 ## The script (run via execute_code on YES)
 
