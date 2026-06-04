@@ -8,10 +8,29 @@ unallocated-receipt (warning) — ACCRECPAYMENT with no link to a known
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import os
 from typing import Any
 
 from ..xero_ar import masked_ref, parse_xero_date
+
+
+def _setting_int(key: str, env_name: str, default: int) -> int:
+    raw = os.environ.get("_AR_SETTINGS_JSON")
+    if raw:
+        try:
+            s = json.loads(raw)
+            if key in s:
+                return int(s[key])
+        except Exception:
+            pass
+    raw_env = os.environ.get(env_name)
+    if raw_env:
+        try:
+            return int(raw_env)
+        except ValueError:
+            pass
+    return default
 
 
 def _fmt_aud(n: float) -> str:
@@ -44,7 +63,7 @@ def run_unallocated_receipts(
     deduped per PaymentID so a payment that appears more than once in
     Xero's paginated response (which it does) only emits one finding.
     """
-    grace_days = _env_int("AR_UNALLOCATED_RECEIPT_AGE_DAYS", 2)
+    grace_days = _setting_int("unallocated_receipt_age_days", "AR_UNALLOCATED_RECEIPT_AGE_DAYS", 2)
     findings: list[dict[str, Any]] = []
     seen: set[str] = set()
     for p in payments:

@@ -8,12 +8,31 @@ deteriorating-payer (warning)     — see SKILL.md PITFALL #1 (currently
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
 
 def _fmt_aud(n: float) -> str:
     return f"A${n:,.2f}"
+
+
+def _setting_float(key: str, env_name: str, default: float) -> float:
+    raw = os.environ.get("_AR_SETTINGS_JSON")
+    if raw:
+        try:
+            s = json.loads(raw)
+            if key in s:
+                return float(s[key])
+        except Exception:
+            pass
+    raw_env = os.environ.get(env_name)
+    if raw_env:
+        try:
+            return float(raw_env)
+        except ValueError:
+            pass
+    return default
 
 
 def _env_float(name: str, default: float) -> float:
@@ -30,7 +49,7 @@ def run_debtor_exposure(entity: str, debtors: list[dict[str, Any]]) -> list[dict
     """Flag any debtor whose total outstanding crosses the limit. Critical
     regardless of aging — concentration risk is the point.
     """
-    limit = _env_float("AR_DEBTOR_EXPOSURE_LIMIT_AUD", 25_000.0)
+    limit = _setting_float("debtor_exposure_limit_aud", "AR_DEBTOR_EXPOSURE_LIMIT_AUD", 25_000.0)
     if limit <= 0:
         return []
 

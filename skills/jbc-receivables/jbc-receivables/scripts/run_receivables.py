@@ -28,6 +28,7 @@ if str(_HERE.parent) not in sys.path:
     sys.path.insert(0, str(_HERE.parent))
 
 from scripts import xero_ar                                    # noqa: E402
+from scripts import settings as _settings                      # noqa: E402
 from scripts.detectors import aging as aging_detectors         # noqa: E402
 from scripts.detectors import cash as cash_detectors           # noqa: E402
 from scripts.detectors import debtors as debtor_detectors      # noqa: E402
@@ -340,8 +341,13 @@ def _run_for_entity(entity: str, *, now: _dt.datetime,
 
 def _gather_findings() -> list[dict[str, Any]]:
     now = _dt.datetime.now(_dt.timezone.utc)
-    writeoff_days = _env_int("AR_WRITEOFF_CANDIDATE_DAYS", 120)
-    payment_lookback = _env_int("AR_PAYMENT_LOOKBACK_DAYS", 180)
+    # Settings come from the DB (Mark can change them at runtime). The
+    # second-tier fallbacks are env vars (legacy) then the original defaults.
+    s = _settings.load("receivables")
+    writeoff_days = _settings.get_int(s, "writeoff_candidate_days", "AR_WRITEOFF_CANDIDATE_DAYS", 120)
+    payment_lookback = _settings.get_int(s, "payment_lookback_days", "AR_PAYMENT_LOOKBACK_DAYS", 180)
+    # Stash a snapshot so detectors can read the same keys without re-querying.
+    os.environ["_AR_SETTINGS_JSON"] = json.dumps(s)
 
     findings: list[dict[str, Any]] = []
     for entity in ("SC", "CQ"):

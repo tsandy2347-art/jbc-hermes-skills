@@ -7,12 +7,42 @@ invoice dicts (see run_receivables.py::age_invoices).
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
 
 def _fmt_aud(n: float) -> str:
     return f"A${n:,.2f}"
+
+
+def _settings_snapshot() -> dict[str, str]:
+    """Read the JSON snapshot stashed by run_receivables._gather_findings.
+    Returns {} if nothing was stashed (e.g. running a single detector standalone)."""
+    raw = os.environ.get("_AR_SETTINGS_JSON")
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _setting_int(key: str, env_name: str, default: int) -> int:
+    """Resolution order: settings table snapshot → env var → hard-coded default."""
+    s = _settings_snapshot()
+    if key in s:
+        try:
+            return int(s[key])
+        except ValueError:
+            pass
+    raw = os.environ.get(env_name)
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return default
 
 
 def _env_int(name: str, default: int) -> int:
@@ -28,7 +58,7 @@ def _env_int(name: str, default: int) -> int:
 def run_aging_escalation(entity: str, aged: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """invoice-90-plus (critical) and invoice-60-plus (warning)."""
     findings: list[dict[str, Any]] = []
-    writeoff_days = _env_int("AR_WRITEOFF_CANDIDATE_DAYS", 120)
+    writeoff_days = _setting_int("writeoff_candidate_days", "AR_WRITEOFF_CANDIDATE_DAYS", 120)
     for inv in aged:
         bucket = inv["ageBucket"]
         age = inv["ageDays"]
@@ -73,7 +103,7 @@ def run_aging_escalation(entity: str, aged: list[dict[str, Any]]) -> list[dict[s
 
 def run_writeoff_candidates(entity: str, aged: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """writeoff-candidate (critical) — invoice older than threshold."""
-    threshold = _env_int("AR_WRITEOFF_CANDIDATE_DAYS", 120)
+    threshold = _setting_int("writeoff_candidate_days", "AR_WRITEOFF_CANDIDATE_DAYS", 120)
     findings: list[dict[str, Any]] = []
     for inv in aged:
         if inv["ageDays"] < threshold:
