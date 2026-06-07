@@ -1,91 +1,35 @@
-"""Read-only Xero OAuth2 client_credentials helper for jbc-receivables.
+"""Read-only Xero helper — now backed by xero_pulse refresh-token flow.
 
-Two tenants — SC and CQ — selected by the `entity` argument ("SC" | "CQ").
-Env vars per tenant: XERO_<entity>_CLIENT_ID / _CLIENT_SECRET / _TENANT_ID.
+Credentials live in mark-agent's XeroTenantToken DB table, populated by the
+OAuth flow at /api/xero/connect on mark-agent. The old per-entity
+client_credentials env vars (XERO_SC_CLIENT_ID etc.) are NO LONGER consulted.
 
-AR-side endpoints only. The scope list is the minimum read scope set.
-No write scopes are requested anywhere in this module.
+READ scopes only. No write paths.
 """
 
 from __future__ import annotations
 
-import base64
 import datetime as _dt
 import json
 import os
 import re
+import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
 
-TOKEN_URL = "https://identity.xero.com/connect/token"
+# Shared token helper lives at /data/hermes/lib/xero_pulse.py
+sys.path.insert(0, "/data/hermes/lib")
+from xero_pulse import get_pulse_token, tenant_configured as _pulse_configured  # noqa: E402
+
 API_BASE = "https://api.xero.com/api.xro/2.0"
-READ_SCOPES = (
-    "accounting.transactions.read "
-    "accounting.contacts.read "
-    "accounting.settings.read"
-)
-
-_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
-
-
-def _creds(entity: str) -> dict[str, str]:
-    e = entity.upper()
-    if e not in ("SC", "CQ"):
-        raise ValueError(f"entity must be SC or CQ, got {entity!r}")
-    cid = os.environ.get(f"XERO_{e}_CLIENT_ID", "")
-    cs = os.environ.get(f"XERO_{e}_CLIENT_SECRET", "")
-    tid = os.environ.get(f"XERO_{e}_TENANT_ID", "")
-    if not cid or not cs or not tid:
-        raise RuntimeError(
-            f"XERO_{e}_CLIENT_ID / _CLIENT_SECRET / _TENANT_ID must be set"
-        )
-    return {"client_id": cid, "client_secret": cs, "tenant_id": tid}
 
 
 def tenant_configured(entity: str) -> bool:
-    try:
-        _creds(entity)
-        return True
-    except RuntimeError:
-        return False
-
-
-def _token(entity: str) -> str:
-    e = entity.upper()
-    cached = _TOKEN_CACHE.get(e)
-    if cached and cached[1] > time.time() + 60:
-        return cached[0]
-
-    creds = _creds(e)
-    basic = base64.b64encode(
-        f"{creds['client_id']}:{creds['client_secret']}".encode()
-    ).decode()
-    body = f"grant_type=client_credentials&scope={urllib.parse.quote(READ_SCOPES)}".encode()
-    req = urllib.request.Request(
-        TOKEN_URL,
-        data=body,
-        headers={
-            "Authorization": f"Basic {basic}",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            data = json.loads(r.read())
-    except urllib.error.HTTPError as e_:
-        raise RuntimeError(
-            f"Xero token exchange failed for {entity}: {e_.code} {e_.read().decode()[:300]}"
-        ) from e_
-
-    tok = data["access_token"]
-    exp = time.time() + int(data.get("expires_in", 1800))
-    _TOKEN_CACHE[e] = (tok, exp)
-    return tok
+    """Drop-in replacement — was env-var-presence check, now is DB-row check."""
+    return _pulse_configured(entity)
 
 
 def _get(
@@ -96,7 +40,7 @@ def _get(
     order: str | None = None,
     if_modified_since: str | None = None,
 ) -> dict[str, Any]:
-    creds = _creds(entity)
+    tok, tenant_id = get_pulse_token(entity)
 
     qp = dict(params or {})
     if where:
@@ -106,14 +50,14 @@ def _get(
     qs = ("?" + urllib.parse.urlencode(qp, quote_via=urllib.parse.quote)) if qp else ""
 
     headers = {
-        "Xero-Tenant-Id": creds["tenant_id"],
+        "Xero-Tenant-Id": tenant_id,
         "Accept": "application/json",
     }
     if if_modified_since:
         headers["If-Modified-Since"] = if_modified_since
 
     for attempt in range(3):
-        tok = _token(entity)
+        tok, tenant_id = get_pulse_token(entity)
         req = urllib.request.Request(
             f"{API_BASE}/{path}{qs}",
             headers={**headers, "Authorization": f"Bearer {tok}"},
