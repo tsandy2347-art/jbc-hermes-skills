@@ -4,7 +4,19 @@ Emits:
   bank-overdraft           (critical)
   bank-low-cash            (warning, only if a threshold env var is set)
   balance-unavailable      (critical)
-  stale-unreconciled       (warning, rolled-up per account)
+
+NOTE on stale-unreconciled (REMOVED 2026-06-07):
+  Xero's BankTransactions API returns IsReconciled=false for transactions
+  that the Xero UI shows as fully reconciled (e.g. anything matched via
+  Cash Coding or Bank Statement Lines). Summing those produces nonsense
+  totals — Westpac NDIS Acc 1432 was being reported as "$35M unreconciled"
+  when the actual statement-vs-ledger drift is ~$52k.
+
+  There is no clean Xero API endpoint that exposes the Statement Balance
+  to compare against the GL balance, so we cannot calculate the real
+  drift programmatically. Detector removed entirely rather than emit
+  misleading numbers. Real bank-rec issues will surface via
+  bank-overdraft / balance-unavailable / monthly trial balance review.
 """
 
 from __future__ import annotations
@@ -16,9 +28,7 @@ from typing import Any
 from ..xero_client import (
     bank_summary,
     list_bank_accounts,
-    list_unreconciled_bank_transactions,
     mask_account,
-    parse_xero_date,
 )
 
 
@@ -87,15 +97,19 @@ def _extract_balance(bs_report: dict[str, Any] | None, account: dict[str, Any]) 
     return _find_balance(rows, account.get("AccountID", ""), account.get("Name", ""))
 
 
-def run_bank(entity: str, *, lookback_days: int, unmatched_days: int) -> list[dict[str, Any]]:
-    """Returns a list of finding-dicts ready for the orchestrator to persist."""
+def run_bank(entity: str, *, lookback_days: int = 0, unmatched_days: int = 0) -> list[dict[str, Any]]:  # noqa: ARG001
+    """Returns a list of finding-dicts ready for the orchestrator to persist.
+
+    lookback_days and unmatched_days are kept in the signature for backward
+    compatibility with the orchestrator but are no longer consumed since the
+    stale-unreconciled detector was removed.
+    """
     findings: list[dict[str, Any]] = []
     today = _dt.datetime.now(_dt.timezone.utc).astimezone(
         _dt.timezone(_dt.timedelta(hours=10))  # AEST
     )
     today_iso = today.date().isoformat()
     week_ago_iso = (today - _dt.timedelta(days=7)).date().isoformat()
-    since_iso = (today - _dt.timedelta(days=lookback_days)).date().isoformat()
 
     try:
         accounts = list_bank_accounts(entity)
@@ -178,44 +192,6 @@ def run_bank(entity: str, *, lookback_days: int, unmatched_days: int) -> list[di
                     },
                 })
 
-        # Stale unreconciled GL lines.
-        try:
-            txns = list_unreconciled_bank_transactions(entity, acc_id, since_iso=since_iso)
-        except Exception:
-            txns = []
-        if not txns:
-            continue
-
-        stale: list[dict[str, Any]] = []
-        total_stale = 0.0
-        for t in txns:
-            if t.get("IsReconciled"):
-                continue
-            d = parse_xero_date(t.get("Date"))
-            if d is None:
-                continue
-            if _business_days_between(d.astimezone(today.tzinfo), today) > unmatched_days:
-                stale.append(t)
-                total_stale += float(t.get("Total") or 0)
-
-        if stale:
-            findings.append({
-                "detector": "stale-unreconciled",
-                "domain": "bank",
-                "severity": "warning",
-                "entity_code": entity,
-                "title": f"{name}: {len(stale)} ledger txn(s) unreconciled > {unmatched_days} business days",
-                "detail": "Oldest line dates back further than the rec threshold. "
-                          f"Total face value {_fmt_aud(total_stale)}. "
-                          "Check Xero Bank Reconciliation screen.",
-                "amount": total_stale,
-                "evidence": {
-                    "dedupKey": f"stale-unreconciled:{entity}:{acc_id}",
-                    "kind": "stale-unreconciled",
-                    "xeroAccountId": acc_id, "accountName": name,
-                    "count": len(stale), "totalAmount": total_stale,
-                    "thresholdBusinessDays": unmatched_days,
-                },
-            })
+        # stale-unreconciled removed — see module docstring for why.
 
     return findings
