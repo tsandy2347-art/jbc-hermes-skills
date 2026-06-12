@@ -90,6 +90,57 @@ def list_manual_journals(entity: str) -> list[dict[str, Any]]:
     return list(data.get("ManualJournals") or [])
 
 
+def list_bills(entity: str, *, from_iso: str | None = None,
+               to_iso: str | None = None) -> list[dict[str, Any]]:
+    """ACCPAY invoices (supplier bills), paginated.
+
+    from_iso / to_iso constrain the bill Date. Strings of the form YYYY-MM-DD.
+    """
+    where_parts = ['Type=="ACCPAY"']
+    if from_iso:
+        y, m, d = from_iso[:4], from_iso[5:7], from_iso[8:10]
+        if y.isdigit() and m.isdigit() and d.isdigit():
+            where_parts.append(f"Date>=DateTime({int(y)},{int(m)},{int(d)})")
+    if to_iso:
+        y, m, d = to_iso[:4], to_iso[5:7], to_iso[8:10]
+        if y.isdigit() and m.isdigit() and d.isdigit():
+            where_parts.append(f"Date<=DateTime({int(y)},{int(m)},{int(d)})")
+    where = " AND ".join(where_parts)
+
+    results: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        data = _get(entity, "Invoices", params={"page": page}, where=where)
+        chunk = list(data.get("Invoices") or [])
+        if not chunk:
+            break
+        results.extend(chunk)
+        if len(chunk) < 100:
+            break
+        page += 1
+        if page > 50:
+            break
+    return results
+
+
+def list_payments(entity: str) -> list[dict[str, Any]]:
+    """All payments, paginated. Used to spot paid-but-returned tickets."""
+    results: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        data = _get(entity, "Payments", params={"page": page})
+        chunk = list(data.get("Payments") or [])
+        if not chunk:
+            break
+        results.extend(chunk)
+        if len(chunk) < 100:
+            break
+        page += 1
+        if page > 50:
+            break
+    return results
+
+
 # ── parsing / masking utilities ──────────────────────────────────────
 
 def parse_xero_date(value: Any) -> _dt.datetime | None:

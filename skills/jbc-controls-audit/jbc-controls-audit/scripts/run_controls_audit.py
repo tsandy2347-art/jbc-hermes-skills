@@ -41,6 +41,7 @@ if str(_HERE.parent) not in sys.path:
 from scripts.detectors import bank as bank_detector              # noqa: E402
 from scripts.detectors import contacts as contacts_detector      # noqa: E402
 from scripts.detectors import journals as journals_detector      # noqa: E402
+from scripts.detectors import paid_invoice_consistency as pic_detector  # noqa: E402
 from scripts.detectors import related_party as rp_detector       # noqa: E402
 from scripts.detectors import sod as sod_detector                # noqa: E402
 from scripts.detectors import users as users_detector            # noqa: E402
@@ -277,6 +278,7 @@ def _gather_findings() -> list[dict[str, Any]]:
             ("contacts", contacts_detector.run_contacts),
             ("bank", bank_detector.run_bank),
             ("users", users_detector.run_users),
+            ("paid-invoice-consistency", pic_detector.run_paid_invoice_consistency),
             # stubs — included so they show up in the call graph; return []
             ("sod", sod_detector.run_sod),
             ("related-party", rp_detector.run_related_party),

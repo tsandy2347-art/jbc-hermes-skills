@@ -36,6 +36,12 @@ optional_environment_variables:
     prompt: "Look-back window (days) for considering a vendor master-data record 'recently changed'. Default 2."
   - name: AUDIT_NO_ABN_WARNING_AUD
     prompt: "Spend threshold above which a no-ABN finding is warning rather than info (rolled-up in aggregate). Default 5000."
+  - name: COMPLIANCE_DATABASE_URL
+    prompt: "Read-only Postgres URL for the jbc-compliance hub DB. Enables the paid-invoice-consistency detector that cross-checks Xero bills against the ticket that created them. Detector silently no-ops if unset."
+  - name: AUDIT_PAID_INVOICE_TOLERANCE_AUD
+    prompt: "Amount-drift tolerance between extracted invoice total and Xero bill Total. Default 0.05."
+  - name: AUDIT_COMPLIANCE_LINK_CUTOFF
+    prompt: "ISO date — Xero bills dated before this are NOT flagged as unlinked (they pre-date the compliance hub). Default 2026-04-22."
 ---
 
 # jbc-controls-audit — daily controls + governance skill
