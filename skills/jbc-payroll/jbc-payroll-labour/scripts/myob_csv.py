@@ -90,12 +90,35 @@ def _to_float(s: str | None) -> float | None:
         return None
 
 
+def _cell(v: Any) -> str:
+    # csv.DictReader stuffs overflow columns (a row with more fields than
+    # headers) into a list under the restkey; join those rather than crashing
+    # on list.strip(). Normal cells are str/None.
+    if isinstance(v, list):
+        v = " ".join(x for x in v if x)
+    return (v or "").strip()
+
+
+def _detect_encoding(path: str) -> str:
+    # MYOB Acumatica exports as Windows-1252 (cp1252); older/manual exports are
+    # UTF-8 (often with BOM). Forcing utf-8 crashed Percy on bytes like 0xe8
+    # (è). Try the likely encodings in order; latin-1 is the never-fails floor.
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            with open(path, "r", encoding=enc) as fh:
+                fh.read()
+            return enc
+        except UnicodeDecodeError:
+            continue
+    return "latin-1"
+
+
 def load(path: str) -> LoadResult:
     if not path or not os.path.exists(path):
         return LoadResult(path=path or "", missing=True, lines=[])
 
     lines: list[PayLine] = []
-    with open(path, "r", newline="", encoding="utf-8-sig") as fh:
+    with open(path, "r", newline="", encoding=_detect_encoding(path)) as fh:
         reader = csv.DictReader(fh)
         # Normalise headers once.
         canonical: dict[str, str] = {}
@@ -104,7 +127,8 @@ def load(path: str) -> LoadResult:
             canonical[h] = _HEADER_ALIASES.get(n, n)
 
         for raw_row in reader:
-            row = {canonical.get(k, k): (v or "").strip() for k, v in raw_row.items()}
+            row = {canonical.get(k, k): _cell(v)
+                   for k, v in raw_row.items() if k is not None}
             entity = (row.get("entity_code") or "").upper()
             if entity not in ("SC", "CQ"):
                 # MYOB occasional typo "Central Queenland" → CQ heuristic.
