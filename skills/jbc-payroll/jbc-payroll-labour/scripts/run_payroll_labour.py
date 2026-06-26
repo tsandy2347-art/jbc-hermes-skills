@@ -123,6 +123,24 @@ def _persist_finding(conn, Jsonb, run_id: str, f: dict[str, Any]) -> bool:
     is_people = bool(f.get("is_people_flag", False))
 
     with conn.cursor() as cur:
+        if not dedup_key:
+            _ec = f.get("entity_code", "")
+            _ti = f.get("title", "")
+            cur.execute(
+                """
+                SELECT id FROM findings
+                 WHERE source_agent=%s AND entity_code=%s AND title=%s AND resolved=false LIMIT 1
+                """,
+                (SOURCE_AGENT, _ec, _ti),
+            )
+            _row = cur.fetchone()
+            if _row:
+                cur.execute(
+                    """UPDATE findings SET detail=%s, amount=%s, evidence=%s, run_id=%s WHERE id=%s""",
+                    (f.get("detail"), f.get("amount"), Jsonb(evidence), run_id, _row[0]),
+                )
+                conn.commit()
+                return False
         if dedup_key:
             cur.execute(
                 """
@@ -227,6 +245,27 @@ def _gather_findings() -> list[dict[str, Any]]:
             "evidence": {
                 "dedupKey": f"myob-export-missing:{today_iso}",
                 "expectedPath": myob.path,
+            },
+        })
+    elif myob.error:
+        # Fail loud: a present-but-unparseable export must never read as 0 rows
+        # / all-clear. Surface it so the run isn't a false green.
+        findings.append({
+            "detector": "myob-export-unreadable",
+            "domain": "ingest",
+            "severity": "warning",
+            "entity_code": "SC",
+            "is_people_flag": False,
+            "title": "MYOB Pay Activity export could not be parsed",
+            "detail": (
+                f"Export at {myob.path} could not be read ({myob.error}). "
+                "MYOB-dependent detectors were skipped this run."
+            ),
+            "amount": None,
+            "evidence": {
+                "dedupKey": f"myob-export-unreadable:{today_iso}",
+                "path": myob.path,
+                "error": myob.error,
             },
         })
 

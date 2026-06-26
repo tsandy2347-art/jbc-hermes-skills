@@ -35,6 +35,44 @@ from ..xero_controls import list_bills, parse_xero_date
 
 COMPLIANCE_CRITICAL_TYPES = {"PUBLIC_LIABILITY", "POLICE_CHECK"}
 
+# Overhead / non-participant vendors that legitimately never route through the
+# compliance hub. A paid Xero bill from one of these is expected to be
+# "unlinked" — we skip it rather than flag it. Matched as case-insensitive
+# substrings against the Xero contact name. Tune via AUDIT_PAID_INVOICE_ALLOWLIST
+# (comma-separated, appended to these defaults).
+DEFAULT_ALLOWLIST_KEYWORDS = (
+    "payroll", "wages", "superannuation", "super fund", "ato",
+    "australian taxation", "office of state revenue", "osr ",
+    "rent", "lease", "body corporate", "real estate",
+    "electricity", "energy", "ergon", "origin", "agl", "water",
+    "telstra", "optus", "vodafone", "internet", "nbn",
+    "railway", "amazon web", "aws", "anthropic", "openai",
+    "microsoft", "google", "xero", "adobe", "atlassian",
+    "insurance", "workcover", "bank", "westpac", "nab", "commonwealth",
+    "fuel", "ampol", "bp ", "shell", "toll", "auspost", "australia post",
+)
+
+
+def _allowlist() -> tuple[str, ...]:
+    extra = os.environ.get("AUDIT_PAID_INVOICE_ALLOWLIST", "")
+    extras = tuple(
+        k.strip().lower() for k in extra.split(",") if k.strip()
+    )
+    return DEFAULT_ALLOWLIST_KEYWORDS + extras
+
+
+def _norm_supplier(name: str | None) -> str:
+    """Normalise a supplier/contact name for cross-system matching: lowercase,
+    drop common company suffixes + punctuation, collapse whitespace."""
+    if not name:
+        return ""
+    s = str(name).lower()
+    for suffix in (" pty ltd", " pty. ltd.", " pty ltd.", " p/l", " ltd",
+                   " limited", " inc", " incorporated", " t/a", " trading as"):
+        s = s.replace(suffix, " ")
+    s = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in s)
+    return " ".join(s.split())
+
 
 def _fingerprint(*parts: Any) -> str:
     blob = json.dumps([("" if p is None else str(p)) for p in parts],
@@ -101,11 +139,26 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
     cutoff = _cutoff_date()
     findings: list[dict[str, Any]] = []
 
-    # 12-month bill window matches the existing 02:25 AEST run cadence
-    # the rest of the controls-audit fleet uses.
+    # Bounded recent window. list_bills() now pulls newest-first and caps at
+    # 5000 rows; a tight window keeps every recent bill inside the cap (a
+    # 365-day window on a high-volume tenant pushed recent bills past the cap
+    # and the detector never saw them). 90 days covers normal supplier-pay
+    # cycles with headroom. Override via AUDIT_PAID_INVOICE_WINDOW_DAYS.
+    window_days = int(_env_float("AUDIT_PAID_INVOICE_WINDOW_DAYS", 90))
     today = _dt.date.today()
-    from_iso = (today - _dt.timedelta(days=365)).isoformat()
+    from_iso = (today - _dt.timedelta(days=window_days)).isoformat()
     to_iso = today.isoformat()
+
+    # Index of known hub suppliers (normalised name) for this entity, plus the
+    # overhead allowlist — used to classify an unlinked bill as a hub-supplier
+    # bypass vs an unvetted vendor vs an expected-direct overhead.
+    known_supplier_names = {
+        _norm_supplier(s.name)
+        for s in snap.suppliers.values()
+        if s.entity_code == entity and s.name
+    }
+    known_supplier_names.discard("")
+    allowlist = _allowlist()
     try:
         bills = list_bills(entity, from_iso=from_iso, to_iso=to_iso)
     except Exception as exc:  # noqa: BLE001
@@ -142,34 +195,68 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
 
         link = snap.tickets_by_billid.get((entity, bill_id))
 
-        # 6. Unlinked bill
+        # 6. Unlinked bill — paid/authorised in Xero with no compliance ticket.
         if link is None:
             if cutoff and bill_date and bill_date < cutoff:
                 continue  # pre-hub, expected to be unlinked
+
+            norm = _norm_supplier(contact_name)
+            is_known = bool(norm) and norm in known_supplier_names
+            is_allowlisted = any(kw in (contact_name or "").lower()
+                                 for kw in allowlist)
+
+            # Expected-direct overhead (payroll, ATO, rent, utilities, SaaS…) —
+            # legitimately never routes through the hub. Skip unless it's a
+            # known participant-service supplier (then the bypass still matters).
+            if is_allowlisted and not is_known:
+                continue
+
+            if is_known:
+                subkind = "hub-supplier-bypass"
+                title = (
+                    f"{entity}: hub supplier paid in Xero with no ticket — "
+                    f"{contact_name} (${bill_total:.0f})"
+                )
+                detail = (
+                    f"\"{contact_name}\" is an approved compliance-hub supplier, "
+                    f"but bill {bill_number} for ${bill_total:.2f} (status "
+                    f"{b.get('Status')}) was created/paid in Xero with no ticket "
+                    f"— it bypassed care-partner approval and the supplier "
+                    f"compliance gate. Confirm it was legitimately approved "
+                    f"outside the hub."
+                )
+            else:
+                subkind = "unvetted-vendor"
+                title = (
+                    f"{entity}: payment to unvetted vendor — "
+                    f"{contact_name} (${bill_total:.0f})"
+                )
+                detail = (
+                    f"Bill {bill_number} for ${bill_total:.2f} (status "
+                    f"{b.get('Status')}) was paid to \"{contact_name}\", which "
+                    f"is not in the compliance hub as a supplier and has no "
+                    f"ticket. If this is a participant expense it skipped "
+                    f"compliance vetting entirely; if it's a genuine overhead, "
+                    f"add it to AUDIT_PAID_INVOICE_ALLOWLIST to silence."
+                )
+
             findings.append({
                 "detector": "paid-invoice-unlinked",
                 "domain": "controls",
-                "severity": "info",
+                "severity": "warning",
                 "entity_code": entity,
                 "is_people_flag": False,
-                "title": (
-                    f"{entity}: Xero bill with no compliance ticket — "
-                    f"{contact_name} (${bill_total:.0f})"
-                ),
-                "detail": (
-                    f"Bill {bill_number} for ${bill_total:.2f} from "
-                    f"\"{contact_name}\" (status {b.get('Status')}) has no "
-                    f"matching ticket in jbc-compliance. Either created in "
-                    f"Xero by hand or the compliance upload event was lost. "
-                    f"Confirm whether this should have come through the hub."
-                ),
+                "title": title,
+                "detail": detail,
                 "amount": bill_total,
                 "evidence": {
                     "dedupKey": f"paid-invoice-unlinked:{entity}:{bill_id}",
                     "kind": "paid-invoice-unlinked",
+                    "subkind": subkind,
                     "xeroBillId": bill_id,
                     "xeroBillNumber": b.get("InvoiceNumber"),
                     "xeroContactName": contact_name,
+                    "knownHubSupplier": is_known,
                     "billDate": b.get("Date"),
                     "billStatus": b.get("Status"),
                     "paid": paid,

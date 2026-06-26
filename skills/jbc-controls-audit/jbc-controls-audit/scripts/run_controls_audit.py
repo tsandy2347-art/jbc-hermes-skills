@@ -198,6 +198,24 @@ def _persist_finding(conn, Jsonb, run_id: str, f: dict[str, Any]) -> bool:
     is_people = bool(f.get("is_people_flag"))
 
     with conn.cursor() as cur:
+        if not dedup_key:
+            _ec = f.get("entity_code", "")
+            _ti = f.get("title", "")
+            cur.execute(
+                """
+                SELECT id FROM findings
+                 WHERE source_agent=%s AND entity_code=%s AND title=%s AND resolved=false LIMIT 1
+                """,
+                (SOURCE_AGENT, _ec, _ti),
+            )
+            _row = cur.fetchone()
+            if _row:
+                cur.execute(
+                    """UPDATE findings SET detail=%s, amount=%s, evidence=%s, run_id=%s WHERE id=%s""",
+                    (f.get("detail"), f.get("amount"), Jsonb(evidence), run_id, _row[0]),
+                )
+                conn.commit()
+                return False
         if dedup_key:
             cur.execute(
                 """

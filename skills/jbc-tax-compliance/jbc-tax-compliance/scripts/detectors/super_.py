@@ -45,20 +45,31 @@ def run_super(entity: str) -> list[dict[str, Any]]:
     today = today_bne()
     tb = xero_tax.trial_balance(entity, today.isoformat())
     accounts = xero_tax.list_accounts(entity)
+
     total = 0.0
-    found = 0
+    found_in_coa = 0
+    found_in_tb = 0
     per_account: list[dict[str, Any]] = []
+
     for c in codes:
         acc = next((a for a in accounts if a.get("Code") == c), None)
-        name = acc.get("Name") if acc else None
+        if acc is None:
+            # Account code doesn't exist on this entity's CoA at all — skip
+            continue
+        found_in_coa += 1
+        name = acc.get("Name")
         bal = xero_tax.find_account_balance(tb, c, name)
         if bal is None:
-            continue
-        found += 1
+            # Account exists in CoA but not in trial balance — it's zero (cleared).
+            # Xero omits zero-balance accounts from the TrialBalance report.
+            bal = 0.0
+        else:
+            found_in_tb += 1
         total += abs(bal)
         per_account.append({"code": c, "name": name, "balance": bal})
 
-    if found == 0:
+    if found_in_coa == 0:
+        # None of the configured codes exist on this entity's chart of accounts
         return [{
             "detector": "super-clearing-position",
             "domain": "super",
@@ -66,9 +77,8 @@ def run_super(entity: str) -> list[dict[str, Any]]:
             "entity_code": entity,
             "title": f"[{entity}] Super clearing balance unreadable",
             "detail": (
-                f"{entity}: configured super account codes {codes} returned no "
-                f"balance in the Xero TrialBalance for {today.isoformat()}. "
-                f"Confirm codes exist on the CoA."
+                f"{entity}: configured super account codes {codes} do not exist "
+                f"on the chart of accounts. Confirm the codes are correct."
             ),
             "evidence": {
                 "dedupKey": f"super-clearing-position:{entity}:{today.isoformat()}",
@@ -86,7 +96,9 @@ def run_super(entity: str) -> list[dict[str, Any]]:
         "title": f"[{entity}] Super clearing balance: ${total:.2f}",
         "detail": (
             f"{entity} super clearing balance at {today.isoformat()} = "
-            f"${total:.2f} across {found} account(s). SG rate {ATO_SG_RATE * 100:.2f}%. "
+            f"${total:.2f} across {found_in_coa} account(s)"
+            + (" (account at zero — cleared)" if found_in_tb == 0 else "")
+            + f". SG rate {ATO_SG_RATE * 100:.2f}%. "
             f"Compare to payroll-system super liability outside the skill."
         ),
         "amount": round(total * 100) / 100,
@@ -96,6 +108,8 @@ def run_super(entity: str) -> list[dict[str, Any]]:
             "asAt": today.isoformat(),
             "totalAbs": round(total * 100) / 100,
             "accounts": per_account,
+            "foundInTrialBalance": found_in_tb,
+            "zeroBecauseNotInTb": found_in_coa - found_in_tb,
             "sgRate": ATO_SG_RATE,
             **ruleset_meta(),
         },

@@ -33,11 +33,13 @@ def tenant_configured(entity: str) -> bool:
 
 
 def _get(entity: str, path: str, params: dict[str, Any] | None = None,
-         where: str | None = None) -> dict[str, Any]:
+         where: str | None = None, order: str | None = None) -> dict[str, Any]:
     tok, tenant_id = get_pulse_token(entity)
     qp = dict(params or {})
     if where:
         qp["where"] = where
+    if order:
+        qp["order"] = order
     qs = ("?" + urllib.parse.urlencode(qp, quote_via=urllib.parse.quote)) if qp else ""
     req = urllib.request.Request(
         f"{API_BASE}/{path}{qs}",
@@ -48,8 +50,30 @@ def _get(entity: str, path: str, params: dict[str, Any] | None = None,
         },
         method="GET",
     )
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read())
+    # Xero throttles at 60 calls/min/tenant; paging many pages back-to-back
+    # intermittently trips 429/503. Retry with backoff (honouring Retry-After)
+    # so a transient throttle doesn't fail the whole detector for the day.
+    last_exc: Exception | None = None
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            last_exc = e
+            if e.code not in (429, 500, 502, 503, 504):
+                raise
+            retry_after = e.headers.get("Retry-After") if e.headers else None
+            try:
+                delay = float(retry_after) if retry_after else 0.0
+            except ValueError:
+                delay = 0.0
+            time.sleep(max(delay, 2.0 * (attempt + 1)))
+        except urllib.error.URLError as e:
+            last_exc = e
+            time.sleep(2.0 * (attempt + 1))
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"Xero GET {path} exhausted retries")
 
 
 # ── endpoint helpers ─────────────────────────────────────────────────
@@ -107,10 +131,16 @@ def list_bills(entity: str, *, from_iso: str | None = None,
             where_parts.append(f"Date<=DateTime({int(y)},{int(m)},{int(d)})")
     where = " AND ".join(where_parts)
 
+    # Newest-first. The endpoint caps hard at 5000 rows (50 pages × 100);
+    # without an explicit order Xero returns oldest-first, so on a tenant
+    # with >5000 bills in the window the cap silently drops the most RECENT
+    # bills — exactly the ones a daily control must see. Date DESC guarantees
+    # recent coverage; pair with a bounded window in the caller.
     results: list[dict[str, Any]] = []
     page = 1
     while True:
-        data = _get(entity, "Invoices", params={"page": page}, where=where)
+        data = _get(entity, "Invoices", params={"page": page}, where=where,
+                    order="Date DESC")
         chunk = list(data.get("Invoices") or [])
         if not chunk:
             break
