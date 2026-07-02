@@ -365,6 +365,121 @@ def _run_for_entity(entity: str, *, now: _dt.datetime,
     except Exception as exc:  # noqa: BLE001
         findings.append(_ingest_failure(entity, "unallocated-receipt", exc))
 
+    # ── ar-aging-buckets detector
+    # Writes one finding per entity per run with bucket totals.
+    # 61-90d and 90+d are critical — target is ZERO for both.
+    if aged:
+        bkt = {"current": 0.0, "1-30": 0.0, "31-60": 0.0, "61-90": 0.0, "90+": 0.0}
+        cnt = {"current": 0,   "1-30": 0,   "31-60": 0,   "61-90": 0,   "90+": 0}
+        for inv in aged:
+            b = inv.get("ageBucket", "current")
+            bkt[b] = bkt.get(b, 0.0) + inv["amountOutstanding"]
+            cnt[b] = cnt.get(b, 0) + 1
+        today_iso = _dt.date.today().isoformat()
+        d61_90  = bkt["61-90"]
+        d90plus = bkt["90+"]
+        sev = "critical" if (d61_90 > 0 or d90plus > 0) else "info"
+        findings.append({
+            "detector": "ar-aging-buckets",
+            "domain": "aging",
+            "severity": sev,
+            "entity_code": entity,
+            "title": (
+                f"{entity} AR aging: 61-90d ${d61_90:,.0f}  90+d ${d90plus:,.0f}  "
+                f"{'⚠️ action required' if sev == 'critical' else '✓ clean'}"
+            ),
+            "detail": (
+                f"{entity} AR aging as at {today_iso}: "
+                f"Current ${bkt['current']:,.2f} ({cnt['current']}), "
+                f"1-30d ${bkt['1-30']:,.2f} ({cnt['1-30']}), "
+                f"31-60d ${bkt['31-60']:,.2f} ({cnt['31-60']}), "
+                f"61-90d ${d61_90:,.2f} ({cnt['61-90']}), "
+                f"90+d ${d90plus:,.2f} ({cnt['90+']}). "
+                f"Target: 61-90d and 90+d = $0. "
+                f"{'Immediate follow-up and write-off required.' if sev == 'critical' else 'All overdue buckets clear.'}"
+            ),
+            "amount": round(d61_90 + d90plus, 2),
+            "evidence": {
+                "dedupKey":      f"ar-aging-buckets:{entity}:{today_iso}",
+                "current":       round(bkt["current"], 2),
+                "d1to30":        round(bkt["1-30"], 2),
+                "d31to60":       round(bkt["31-60"], 2),
+                "d61to90":       round(d61_90, 2),
+                "d90plus":       round(d90plus, 2),
+                "count_current": cnt["current"],
+                "count_1to30":   cnt["1-30"],
+                "count_31to60":  cnt["31-60"],
+                "count_61to90":  cnt["61-90"],
+                "count_90plus":  cnt["90+"],
+                "asOf":          today_iso,
+            },
+        })
+
+    # ── ar-collections-weekly detector
+    # Sums payments received vs new invoices raised in last 7 days.
+    try:
+        seven_days_ago = (now - _dt.timedelta(days=7)).isoformat()
+        weekly_payments = xero_ar.list_sales_payments_since(entity, seven_days_ago)
+        cash_collected = sum(float(p.get("Amount") or 0) for p in weekly_payments)
+        new_invoice_amount = sum(
+            float(inv.get("Total") or 0)
+            for inv in invoices
+            if (xero_ar.parse_xero_date(inv.get("Date")) or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc))
+               >= (now - _dt.timedelta(days=7))
+        )
+        today_iso = _dt.date.today().isoformat()
+        findings.append({
+            "detector": "ar-collections-weekly",
+            "domain": "intelligence",
+            "severity": "info",
+            "entity_code": entity,
+            "title": (
+                f"{entity} weekly: collected ${cash_collected:,.0f}, "
+                f"new billed ${new_invoice_amount:,.0f}"
+            ),
+            "detail": (
+                f"{entity} last 7 days: collected ${cash_collected:,.2f} from "
+                f"{len(weekly_payments)} payments. New invoices: "
+                f"${new_invoice_amount:,.2f}. "
+                f"{'AR reducing.' if cash_collected >= new_invoice_amount else 'AR growing.'}"
+            ),
+            "amount": round(cash_collected, 2),
+            "evidence": {
+                "dedupKey":          f"ar-collections-weekly:{entity}:{today_iso}",
+                "cashCollected":     round(cash_collected, 2),
+                "paymentCount":      len(weekly_payments),
+                "newInvoicedAmount": round(new_invoice_amount, 2),
+                "asOf":              today_iso,
+            },
+        })
+    except Exception as exc:  # noqa: BLE001
+        findings.append(_ingest_failure(entity, "ar-collections-weekly", exc))
+
+    # ── ar-total summary detector
+    # One info finding per entity per run — history for week-over-week tracking.
+    if aged:
+        total_outstanding = sum(inv["amountOutstanding"] for inv in aged)
+        total_invoices = len(aged)
+        today_iso = _dt.date.today().isoformat()
+        findings.append({
+            "detector": "ar-total",
+            "domain": "intelligence",
+            "severity": "info",
+            "entity_code": entity,
+            "title": f"{entity} total AR: ${total_outstanding:,.2f} ({total_invoices} invoices)",
+            "detail": (
+                f"Total AR outstanding for {entity} as at {today_iso}: "
+                f"${total_outstanding:,.2f} across {total_invoices} invoices."
+            ),
+            "amount": round(total_outstanding, 2),
+            "evidence": {
+                "dedupKey":      f"ar-total:{entity}:{today_iso}",
+                "totalOutstanding": round(total_outstanding, 2),
+                "invoiceCount":  total_invoices,
+                "asOf":          today_iso,
+            },
+        })
+
     return findings
 
 
