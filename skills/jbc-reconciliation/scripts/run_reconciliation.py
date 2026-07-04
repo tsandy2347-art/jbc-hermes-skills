@@ -309,6 +309,49 @@ def main() -> int:
                 print(json.dumps({"warn": "persist-failed", "error": str(exc),
                                   "finding": {k: f.get(k) for k in ("detector", "entity_code")}}))
 
+        # ── Auto-resolve: conditions that stopped reproducing. ──
+        # Every detector re-emits ongoing conditions on every run (upserted by
+        # dedupKey), so an unresolved finding whose dedupKey was NOT emitted
+        # this run is a condition that no longer exists — an overdrawn balance
+        # that recovered, a feed that reconnected. Without this sweep those
+        # rows linger forever and get reported as live weeks later. Skipped
+        # when any detector failed mid-run: a crashed detector emits nothing,
+        # and sweeping then would blind-resolve real conditions.
+        swept = 0
+        had_ingest_failure = any(
+            (f.get("evidence") or {}).get("kind") == "ingest-failure" for f in findings
+        )
+        if not had_ingest_failure:
+            emitted_keys = [
+                f["evidence"]["dedupKey"] for f in findings
+                if (f.get("evidence") or {}).get("dedupKey")
+            ]
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE findings
+                           SET resolved = true,
+                               resolved_by = 'auto:not-reproduced',
+                               resolved_at = now(),
+                               resolution_note = %s
+                         WHERE source_agent = %s
+                           AND resolved = false
+                           AND (evidence->>'dedupKey' IS NULL
+                                OR NOT (evidence->>'dedupKey' = ANY(%s)))
+                        """,
+                        (
+                            f"auto-resolved: condition absent from run {run_id}",
+                            SOURCE_AGENT,
+                            emitted_keys,
+                        ),
+                    )
+                    swept = cur.rowcount
+                conn.commit()
+            except Exception as exc:  # noqa: BLE001
+                traceback.print_exc()
+                print(json.dumps({"warn": "sweep-failed", "error": str(exc)}))
+
         status = "exceptions" if findings else "ok"
         _update_audit_run_end(
             conn, run_id, status=status, total=len(findings), crit=crit, people=0,
@@ -320,6 +363,7 @@ def main() -> int:
             "ok": True, "run_id": run_id, "status": status,
             "findings_total": len(findings), "findings_inserted": inserted,
             "findings_deduped": len(findings) - inserted,
+            "findings_auto_resolved": swept,
             "critical_count": crit,
             "duration_ms": int((time.time() - started) * 1000),
         }, indent=2))
