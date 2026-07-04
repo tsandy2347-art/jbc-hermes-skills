@@ -81,6 +81,7 @@ def run_debtor_exposure(entity: str, debtors: list[dict[str, Any]]) -> list[dict
                 "kind": "debtor-exposure-breach",
                 "xeroContactId": d["xeroContactId"],
                 "contactRef": ref,
+                "contactName": d["name"],
                 "openInvoiceCount": d["invoiceCount"],
                 "oldestAgeDays": d["oldestAgeDays"],
                 "limit": limit,
