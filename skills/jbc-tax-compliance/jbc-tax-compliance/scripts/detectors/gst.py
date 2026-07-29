@@ -4,12 +4,22 @@ Three detectors, all per-entity (never consolidated):
   - gst-position         (info, live net GST for the open BAS period)
   - gst-coding-anomaly   (warning, untagged net or implied-rate variance)
   - gst-cash-shortfall   (warning <80% coverage, critical <50%)
+
+NOTE (2026-07-28): the journal-level breakdown (sales/purchases split,
+coding-anomaly, cash-shortfall) needs accounting.journals.read, which Xero
+gates behind the Advanced pricing tier + a manual security-approval process
+— not currently granted (see mark-agent/lib/xero/app-config.ts). When
+list_journals_since 401s, run_gst() degrades to a ledger-only gst-position
+built straight from the GST control account's Trial Balance balance —
+still a genuinely live, current figure, just without the sales/purchases
+split or the anomaly checks that need journal-line detail.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
 import os
+import urllib.error
 from typing import Any
 
 from scripts import xero_tax
@@ -101,16 +111,60 @@ def run_gst(entity: str, *, lookback_days: int) -> list[dict[str, Any]]:
     )
 
     accounts = xero_tax.list_accounts(entity)
-    journals = xero_tax.list_journals_since(entity, since)
-    tax_types = xero_tax.aggregate_tax_types(journals)
-    gst = _compute_gst_aggregates(tax_types)
-
     period = bas_period_for(today, _bas_cycle(entity))
     tb = xero_tax.trial_balance(entity, today.isoformat())
     codes = _gst_account_codes(entity, accounts)
-    cash = _derive_cash_set_aside(tb, accounts, codes)
-
+    ledger_balance = _derive_cash_set_aside(tb, accounts, codes)
     meta = ruleset_meta()
+
+    try:
+        journals = xero_tax.list_journals_since(entity, since)
+    except urllib.error.HTTPError:
+        # No journal-line access (see module docstring) — degrade to a
+        # ledger-only net GST figure straight off the control account
+        # balance. Still live, still current, just no sales/purchases split
+        # and no journal-dependent anomaly checks below.
+        out.append({
+            "detector": "gst-position",
+            "domain": "gst",
+            "severity": "info",
+            "entity_code": entity,
+            "title": (
+                f"[{entity}] Live GST position {period.label}: "
+                f"${(ledger_balance or 0):.2f} owed (ledger balance)"
+            ),
+            "detail": (
+                f"{entity} GST control-account balance for {period.label}: "
+                f"${(ledger_balance or 0):.2f}.\n"
+                f"  Period: {period.start.isoformat()} → {period.end.isoformat()}\n"
+                f"  Due:    {period.due_date.isoformat()}\n"
+                f"  Sales/purchases breakdown and coding-anomaly checks are "
+                f"unavailable — they need accounting.journals.read, which "
+                f"Xero gates behind the Advanced tier + approval (not "
+                f"currently granted)."
+            ),
+            "amount": ledger_balance,
+            "evidence": {
+                "dedupKey": f"gst-position:{entity}:{period.label}",
+                "entityCode": entity,
+                "period": {
+                    "start": period.start.isoformat(),
+                    "end": period.end.isoformat(),
+                    "label": period.label,
+                    "dueIso": period.due_date.isoformat(),
+                },
+                "netGst": ledger_balance,
+                "source": "trial-balance-control-account",
+                "breakdownAvailable": False,
+                "lookbackDays": lookback_days,
+                **meta,
+            },
+        })
+        return out
+
+    tax_types = xero_tax.aggregate_tax_types(journals)
+    gst = _compute_gst_aggregates(tax_types)
+    cash = ledger_balance
 
     # 1) gst-position (info)
     out.append({
