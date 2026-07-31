@@ -7,8 +7,8 @@ Six sub-checks per entity, all SYSTEMIC (no people-flag):
   3. wrong_entity          — ticket entity ≠ Xero tenant the bill is in (warn)
   4. compliance_lapsed     — supplier compliance expired at invoice date
                                                                       (warn/crit)
-  5. duplicate_xero_bill   — same (supplier_id, invoice_number) uploaded
-                              to ≥2 distinct Xero billIds            (critical)
+  5. duplicate_xero_bill   — ≥2 LIVE Xero bills for one supplier sharing the
+                              same Xero invoice number AND total     (critical)
   6. unlinked_bill         — Xero bill ≥ AUDIT_COMPLIANCE_LINK_CUTOFF
                               with no matching XERO_UPLOADED event   (info)
 
@@ -436,26 +436,50 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
                     },
                 })
 
-    # 5. Duplicate Xero bills across multiple tickets in this entity
-    by_key: dict[tuple[str | None, str], list[cdb.TicketLink]] = {}
+    # 5. Duplicate Xero bills across multiple tickets in this entity.
+    #
+    # Ground truth is the Xero bill, NOT the ticket's extracted invoice number.
+    # Two tickets routinely carry the same extracted number while pointing at
+    # genuinely different bills (mis-extraction, or a supplier reusing a number
+    # months apart), which produced a run of false "double-pay" criticals. So:
+    #   - resolve each ticket to the bill it actually created;
+    #   - drop bills that are VOIDED/DELETED/DRAFT — a duplicate that has
+    #     already been reversed is not an open exposure;
+    #   - drop bills outside the pulled window — unverifiable, never flag;
+    #   - group on the Xero InvoiceNumber *and* the Xero total, so two
+    #     different invoices sharing a number are not called a double-pay;
+    #   - dedupe by bill id, because several tickets can point at one bill.
+    live_bills = {
+        b["InvoiceID"]: b
+        for b in bills
+        if b.get("InvoiceID")
+        and b.get("Status") not in ("VOIDED", "DELETED", "DRAFT")
+    }
+    by_key: dict[tuple[str, str, str], dict[str, cdb.TicketLink]] = {}
     for lnk in snap.all_links:
-        if lnk.entity_code != entity:
+        if lnk.entity_code != entity or not lnk.supplier_id:
             continue
-        if not lnk.invoice_number or not lnk.supplier_id:
+        bill = live_bills.get(lnk.xero_bill_id)
+        if bill is None:
             continue
-        by_key.setdefault(
-            (lnk.supplier_id, lnk.invoice_number.strip().lower()), []
-        ).append(lnk)
-    for (sid, inum), links in by_key.items():
-        distinct_bill_ids = {l.xero_bill_id for l in links}
+        xero_num = (bill.get("InvoiceNumber") or "").strip().lower()
+        if not xero_num:
+            continue
+        key = (lnk.supplier_id, xero_num, f"{_bill_total(bill):.2f}")
+        by_key.setdefault(key, {})[lnk.xero_bill_id] = lnk
+    for (sid, inum, unit_key), links_by_bill in by_key.items():
+        distinct_bill_ids = set(links_by_bill)
         if len(distinct_bill_ids) < 2:
             continue
         supplier = snap.suppliers.get(sid) if sid else None
         supplier_name = supplier.name if supplier else "(unknown)"
-        sorted_links = sorted(links, key=lambda l: l.xero_uploaded_at)
-        total = sum(
-            float(l.extracted_total) for l in sorted_links if l.extracted_total
-        ) or None
+        sorted_links = sorted(
+            links_by_bill.values(), key=lambda l: l.xero_uploaded_at
+        )
+        # Exposure is the value of the EXTRA copies, not the sum of all of
+        # them — one of these bills is the legitimate one.
+        unit_total = float(unit_key)
+        total = unit_total * (len(distinct_bill_ids) - 1)
         fp = _fingerprint(*sorted(distinct_bill_ids))
         findings.append({
             "detector": "paid-invoice-duplicate-bill",
@@ -468,9 +492,12 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
                 f"{len(distinct_bill_ids)}× — {supplier_name} #{inum}"
             ),
             "detail": (
-                f"Invoice number \"{inum}\" from supplier \"{supplier_name}\" "
-                f"was uploaded to Xero {len(distinct_bill_ids)} times via "
-                f"separate compliance tickets. Likely a double-pay risk. "
+                f"Xero holds {len(distinct_bill_ids)} live bills for supplier "
+                f"\"{supplier_name}\" with the same invoice number \"{inum}\" "
+                f"and the same total (${unit_total:.2f} each), created via "
+                f"separate compliance tickets. Exposure is ${total:.2f} — the "
+                f"value of the extra copies. Voided and deleted bills are "
+                f"excluded, so these are all still open. "
                 f"Tickets: " + ", ".join(f"#{l.ticket_number}" for l in sorted_links)
                 + "."
             ),
@@ -482,12 +509,22 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
                 "kind": "paid-invoice-duplicate-bill",
                 "supplierId": sid,
                 "supplierName": supplier_name,
+                # Xero's invoice number, not the ticket's extracted one.
                 "invoiceNumber": inum,
+                "unitTotal": unit_total,
+                "exposure": total,
                 "uploads": [
                     {
                         "ticketId": l.ticket_id,
                         "ticketNumber": l.ticket_number,
                         "xeroBillId": l.xero_bill_id,
+                        "xeroBillStatus": (
+                            live_bills[l.xero_bill_id].get("Status")
+                        ),
+                        "xeroBillNumber": (
+                            live_bills[l.xero_bill_id].get("InvoiceNumber")
+                        ),
+                        "xeroBillTotal": _bill_total(live_bills[l.xero_bill_id]),
                         "uploadedAt": l.xero_uploaded_at.isoformat()
                         if l.xero_uploaded_at else None,
                         "extractedTotal": l.extracted_total,
