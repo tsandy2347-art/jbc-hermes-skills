@@ -65,6 +65,13 @@ SOURCE_AGENT = "controls-audit"
 STATE_DETECTORS = [
     "no-abn",
     "elevated-user-roster",
+    # Detector-failure findings are state too: if the check runs clean
+    # next time, the 'this is broken' finding must clear itself.
+    "bank-detector-failed",
+    "contacts-detector-failed",
+    "paid-invoice-consistency-failed",
+    "users-detector-failed",
+    "ingest-failure",
 ]
 
 

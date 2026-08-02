@@ -57,6 +57,11 @@ STATE_DETECTORS = [
     "ar-aging-buckets",
     "ar-collections-weekly",
     "debtor-exposure-breach",
+    # Detector-failure findings are state too: if the check runs clean
+    # next time, the 'this is broken' finding must clear itself.
+    "receivables-snapshot-failed",
+    "receivables-aging-failed",
+    "ingest-failure",
 ]
 
 

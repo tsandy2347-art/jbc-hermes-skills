@@ -46,6 +46,10 @@ SOURCE_AGENT = "revenue-claims"
 # Only these are eligible for resolve-on-absence; point-in-time event
 # detectors are omitted on purpose (see lib/findings_sweep.py).
 STATE_DETECTORS = [
+    # Detector-failure findings are state too: if the check runs clean
+    # next time, the 'this is broken' finding must clear itself.
+    "xero-not-configured",
+    "ingest-failure",
 ]
 
 

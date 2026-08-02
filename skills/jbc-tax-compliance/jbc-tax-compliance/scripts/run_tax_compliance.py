@@ -57,6 +57,13 @@ STATE_DETECTORS = [
     "super-clearing-position",
     "payroll-tax-threshold",
     "bas-deadline",
+    # Detector-failure findings are state too: if the check runs clean
+    # next time, the 'this is broken' finding must clear itself.
+    "gst-detector-failed",
+    "payg-detector-failed",
+    "super-detector-failed",
+    "payroll-tax-detector-failed",
+    "ingest-failure",
 ]
 
 

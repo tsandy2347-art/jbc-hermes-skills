@@ -48,6 +48,11 @@ STATE_DETECTORS = [
     "labour-cost-pct",
     "unverified-line",
     "duplicate-payline",
+    # Detector-failure findings are state too: if the check runs clean
+    # next time, the 'this is broken' finding must clear itself.
+    "myob-export-missing",
+    "myob-export-unreadable",
+    "ingest-failure",
 ]
 
 

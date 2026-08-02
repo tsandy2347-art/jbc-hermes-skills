@@ -55,6 +55,11 @@ STATE_DETECTORS = [
     "late-posted-aggregate",
     "intercompany-codes-not-configured",
     "intercompany-mismatch",
+    # Detector-failure findings are state too: if the check runs clean
+    # next time, the 'this is broken' finding must clear itself.
+    "bank-list-failed",
+    "mj-list-failed",
+    "ingest-failure",
 ]
 
 
