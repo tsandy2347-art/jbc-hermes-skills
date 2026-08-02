@@ -195,6 +195,25 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
 
         link = snap.tickets_by_billid.get((entity, bill_id))
 
+        # Fallback: the exact billId link only exists when the hub itself
+        # pushed the bill to Xero. A bill keyed in by hand has no billId, so
+        # match it back to its ticket on the extracted invoice number instead.
+        # Corroborate on amount where both sides have one — an invoice number
+        # alone is not unique enough to clear a control finding on.
+        matched_by = "billId" if link else None
+        if link is None:
+            inv_key = cdb.normalise_invoice_no(b.get("InvoiceNumber"))
+            cand = snap.tickets_by_invoice_no.get((entity, inv_key)) if inv_key else None
+            if cand is not None:
+                amounts_agree = (
+                    cand.extracted_total is None
+                    or bill_total == 0
+                    or abs(cand.extracted_total - bill_total) <= max(0.02, bill_total * 0.01)
+                )
+                if amounts_agree:
+                    link = cand
+                    matched_by = "invoiceNumber"
+
         # 6. Unlinked bill — paid/authorised in Xero with no compliance ticket.
         if link is None:
             if cutoff and bill_date and bill_date < cutoff:
@@ -334,6 +353,10 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
                         "kind": "paid-invoice-amount-drift",
                         "ticketId": link.ticket_id,
                         "ticketNumber": link.ticket_number,
+                        # "invoiceNumber" here means the bill was keyed into
+                        # Xero by hand rather than pushed by the hub — useful
+                        # when judging how a drift arose.
+                        "matchedBy": matched_by,
                         "xeroBillId": bill_id,
                         "extractedTotal": link.extracted_total,
                         "xeroTotal": bill_total,
@@ -458,6 +481,12 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
     by_key: dict[tuple[str, str, str], dict[str, cdb.TicketLink]] = {}
     for lnk in snap.all_links:
         if lnk.entity_code != entity or not lnk.supplier_id:
+            continue
+        # This check is about two Xero bills existing for one invoice, so it
+        # only considers tickets the hub actually pushed. Tickets with no
+        # XERO_UPLOADED event carry no bill id (and no upload timestamp to
+        # order by) and are not duplicates of anything in Xero.
+        if not lnk.xero_bill_id:
             continue
         bill = live_bills.get(lnk.xero_bill_id)
         if bill is None:

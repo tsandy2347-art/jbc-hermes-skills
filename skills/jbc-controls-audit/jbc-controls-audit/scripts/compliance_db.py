@@ -79,6 +79,20 @@ class ComplianceSnapshot:
     all_links: list[TicketLink] = field(default_factory=list)
     suppliers: dict[str, SupplierRow] = field(default_factory=dict)
     compliance_by_supplier: dict[str, list[ComplianceRow]] = field(default_factory=dict)
+    #: (entity_code, normalised invoice number) -> ticket, for EVERY processed
+    #: ticket including ones the hub never pushed to Xero. A bill entered into
+    #: Xero by hand has no billId to join on, but it still went through
+    #: compliance — without this index it is wrongly reported as a bypass.
+    tickets_by_invoice_no: dict[tuple[str, str], TicketLink] = field(default_factory=dict)
+
+
+def normalise_invoice_no(value: str | None) -> str:
+    """Invoice numbers are compared loosely: Xero and the extractor disagree on
+    punctuation, case and leading zeros ('INV-0016' / 'inv0016' / '0016')."""
+    if not value:
+        return ""
+    s = "".join(ch for ch in str(value).upper() if ch.isalnum())
+    return s.lstrip("0") or s
 
 
 def configured() -> bool:
@@ -186,7 +200,13 @@ def _load(conn) -> ComplianceSnapshot:
                 AND rcp."createdAt" > xu."createdAt"
           )) AS returned_after_xero
         FROM "Ticket" t
-        JOIN LATERAL (
+        -- LEFT, not inner. A ticket the hub never pushed to Xero (someone
+        -- keyed the bill in by hand) has no XERO_UPLOADED event, and an inner
+        -- join dropped it from the snapshot entirely — so its bill looked like
+        -- it had bypassed compliance when in fact the ticket exists and was
+        -- resolved. Ticket 13507 / Maroochy Home Assist $34,335 was exactly
+        -- this (Tony, 2 Aug 2026).
+        LEFT JOIN LATERAL (
           SELECT e.id, e."createdAt", e.data
             FROM "TicketEvent" e
            WHERE e."ticketId" = t.id
@@ -213,8 +233,6 @@ def _load(conn) -> ComplianceSnapshot:
             if not code:
                 continue
             bill_id = (xu_data or {}).get("billId") if isinstance(xu_data, dict) else None
-            if not bill_id:
-                continue
             bill_number = (xu_data or {}).get("billNumber") if isinstance(xu_data, dict) else None
 
             extracted_total: float | None = None
@@ -251,7 +269,7 @@ def _load(conn) -> ComplianceSnapshot:
                 invoice_number=invoice_number,
                 invoice_date=invoice_date,
                 extracted_total=extracted_total,
-                xero_bill_id=str(bill_id),
+                xero_bill_id=str(bill_id) if bill_id else "",
                 xero_bill_number=bill_number,
                 xero_uploaded_at=xu_at,
                 is_business_invoice=bool(is_biz),
@@ -259,6 +277,14 @@ def _load(conn) -> ComplianceSnapshot:
                 returned_after_xero=bool(returned),
             )
             snap.all_links.append(link)
-            snap.tickets_by_billid[(code, link.xero_bill_id)] = link
+            if link.xero_bill_id:
+                snap.tickets_by_billid[(code, link.xero_bill_id)] = link
+            # Secondary index on the extracted invoice number, so a bill keyed
+            # into Xero by hand can still be matched back to its ticket. First
+            # writer wins: an exact billId link is always preferred, and this
+            # is only ever consulted after that lookup misses.
+            inv_key = normalise_invoice_no(link.invoice_number)
+            if inv_key:
+                snap.tickets_by_invoice_no.setdefault((code, inv_key), link)
 
     return snap
