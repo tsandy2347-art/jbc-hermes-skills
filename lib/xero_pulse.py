@@ -12,7 +12,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-import psycopg2  # type: ignore
+import psycopg  # type: ignore  (psycopg v3 — psycopg2 not installed on this runtime)
 
 # Built piecewise so secret-redaction tooling doesn't squash the literal URL.
 _SCHEME = "ht" + "tps" + ":" + "/" + "/"
@@ -25,6 +25,21 @@ APP = "pulse"
 _CACHE: dict[str, tuple[str, str, float]] = {}
 _LOCK = threading.Lock()
 _REFRESH_BUFFER_SEC = 120
+
+# Xero access tokens live 30 minutes — always, no exceptions. A stored
+# "expiresAt" further out than this is therefore not a longer-lived token, it
+# is a corrupt row: something wrote the expiry in the wrong timezone or the
+# wrong units. Trusting it means handing every caller a dead token and getting
+# 401s until the fake expiry passes.
+#
+# This is not hypothetical. On 2 Aug 2026 both SC and CQ rows carried an expiry
+# exactly +10h (the Brisbane offset) beyond the real one, so the whole finance
+# fleet silently read zero rows out of Xero for hours — and the payables
+# detector reported "ok, no exceptions" the entire time.
+#
+# So the expiry is treated as an upper bound to be sanity-checked, never as
+# gospel: anything beyond the maximum possible token life means refresh now.
+MAX_ACCESS_TOKEN_LIFE_SEC = 35 * 60
 
 
 class PulseTokenError(RuntimeError):
@@ -48,7 +63,7 @@ def _pulse_creds() -> tuple[str, str]:
 
 def _fetch_row(entity: str) -> dict[str, Any]:
     e = entity.upper()
-    with psycopg2.connect(_db_url()) as conn:
+    with psycopg.connect(_db_url()) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 'SELECT "tenantId", "accessToken", "refreshToken", '
@@ -100,7 +115,7 @@ def _save_rolled(entity: str, tok: dict[str, Any]) -> None:
     new_access = tok["access_token"]
     new_refresh = tok["refresh_token"]
     exp_at = _dt.datetime.utcnow() + _dt.timedelta(seconds=int(tok["expires_in"]))
-    with psycopg2.connect(_db_url()) as conn:
+    with psycopg.connect(_db_url()) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 'UPDATE "XeroTenantToken" '
@@ -114,7 +129,7 @@ def _save_rolled(entity: str, tok: dict[str, Any]) -> None:
 
 def _touch_used(entity: str) -> None:
     try:
-        with psycopg2.connect(_db_url()) as conn:
+        with psycopg.connect(_db_url()) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     'UPDATE "XeroTenantToken" SET "lastUsedAt" = NOW() '
@@ -126,6 +141,26 @@ def _touch_used(entity: str) -> None:
         pass
 
 
+def _usable(exp_epoch: float, now: float | None = None) -> bool:
+    """A stored/cached expiry is usable only if it is both far enough away to
+    be worth using AND close enough to be physically possible."""
+    n = time.time() if now is None else now
+    return n + _REFRESH_BUFFER_SEC < exp_epoch <= n + MAX_ACCESS_TOKEN_LIFE_SEC
+
+
+def _refresh_locked(entity: str) -> tuple[str, str]:
+    """Refresh + persist + cache. Caller must hold _LOCK."""
+    row = _fetch_row(entity)
+    tok = _do_refresh(row["refresh_token"])
+    # Persist BEFORE using: Xero rotates the refresh token on every use, so a
+    # crash between refresh and save costs us the connection entirely.
+    _save_rolled(entity, tok)
+    new_exp = time.time() + float(tok["expires_in"])
+    _CACHE[entity] = (tok["access_token"], row["tenant_id"], new_exp)
+    _touch_used(entity)
+    return tok["access_token"], row["tenant_id"]
+
+
 def get_pulse_token(entity: str) -> tuple[str, str]:
     e = entity.upper()
     if e not in ("SC", "CQ"):
@@ -133,20 +168,29 @@ def get_pulse_token(entity: str) -> tuple[str, str]:
 
     with _LOCK:
         cached = _CACHE.get(e)
-        if cached and cached[2] > time.time() + _REFRESH_BUFFER_SEC:
+        if cached and _usable(cached[2]):
             return cached[0], cached[1]
 
         row = _fetch_row(e)
-        if row["exp_epoch"] > time.time() + _REFRESH_BUFFER_SEC:
+        if _usable(row["exp_epoch"]):
             _CACHE[e] = (row["access_token"], row["tenant_id"], row["exp_epoch"])
             return row["access_token"], row["tenant_id"]
 
-        tok = _do_refresh(row["refresh_token"])
-        _save_rolled(e, tok)
-        new_exp = time.time() + float(tok["expires_in"])
-        _CACHE[e] = (tok["access_token"], row["tenant_id"], new_exp)
-        _touch_used(e)
-        return tok["access_token"], row["tenant_id"]
+        return _refresh_locked(e)
+
+
+def force_refresh(entity: str) -> tuple[str, str]:
+    """Discard whatever we think we know and mint a new access token.
+
+    Clients call this after Xero answers 401: the stored expiry said the token
+    was fine, Xero disagrees, and Xero is the authority. Without this a bad
+    expiry row locks the caller out until it lapses on its own."""
+    e = entity.upper()
+    if e not in ("SC", "CQ"):
+        raise ValueError(f"entity must be SC or CQ, got {entity!r}")
+    with _LOCK:
+        _CACHE.pop(e, None)
+        return _refresh_locked(e)
 
 
 def tenant_configured(entity: str) -> bool:

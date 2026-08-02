@@ -194,13 +194,29 @@ def _check_duplicates(entity: str, bills: list[dict[str, Any]]) -> list[dict[str
                 num_j = (inv_j.get("InvoiceNumber") or "").strip()
                 tot_j = float(inv_j.get("Total") or 0)
                 same_num = bool(num_i) and num_i == num_j
-                near = abs(tot_i - tot_j) <= 0.01 and abs(d_i - d_j) <= one_day
+                # Amount + date alone is NOT a duplicate signal in home care.
+                # A supplier bills the same standard price for the same service
+                # on the same day for many different participants — $99 lawn
+                # mowing, twelve times, is twelve real invoices. Matching on
+                # amount+date alone produced 2,192 "critical duplicates" in a
+                # single run, none of them real.
+                #
+                # Two bills carrying DIFFERENT invoice numbers are different
+                # bills, full stop. Amount+date only means anything when the
+                # numbers cannot tell them apart.
+                both_numbered = bool(num_i) and bool(num_j)
+                near = (
+                    abs(tot_i - tot_j) <= 0.01
+                    and abs(d_i - d_j) <= one_day
+                    and not (both_numbered and num_i != num_j)
+                )
                 if same_num or near:
                     matches.append({
                         "xeroInvoiceId": id_j,
                         "invoiceNumber": num_j or None,
                         "total": tot_j,
                         "date": d_j.date().isoformat(),
+                        "matchedOn": "invoice-number" if same_num else "amount-and-date",
                     })
             if not matches:
                 continue
@@ -208,10 +224,14 @@ def _check_duplicates(entity: str, bills: list[dict[str, Any]]) -> list[dict[str
                 continue
             flagged.add(id_i)
             contact = (inv_i.get("Contact") or {}).get("Name") or "(unknown supplier)"
+            # A repeated invoice NUMBER is a real duplicate and blocks payment.
+            # An unnumbered same-amount/same-day pair is only ambiguous — worth
+            # a look, not worth waking anyone up.
+            by_number = any(m.get("matchedOn") == "invoice-number" for m in matches)
             out.append({
                 "detector": "duplicate-invoice",
                 "domain": "ap",
-                "severity": "critical",
+                "severity": "critical" if by_number else "warning",
                 "entity_code": entity,
                 "title": f"Possible duplicate — {contact} {num_i or '(no number)'}",
                 "detail": (
