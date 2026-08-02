@@ -302,24 +302,18 @@ def _gather_findings() -> list[dict[str, Any]]:
                                  "/data/hermes/imports/alayacare_latest.csv")
     ac = alayacare_csv.load(ac_path)
     if ac.missing:
-        findings.append({
-            "detector": "alayacare-export-missing",
-            "domain": "ingest",
-            "severity": "info",
-            "entity_code": "SC",
-            "is_people_flag": False,
-            "title": "AlayaCare timesheet CSV missing",
-            "detail": (
-                f"Expected AlayaCare CSV at {ac.path}. Hourly-shape detectors "
-                "(ghost-shift, overtime-spike, utilisation-drop, "
-                "broken-shift-trigger) will be skipped this run."
-            ),
-            "amount": None,
-            "evidence": {
-                "dedupKey": f"alayacare-export-missing",
-                "expectedPath": ac.path,
-            },
-        })
+        # AlayaCare export is NOT available — Tony confirmed 2 Aug 2026 there
+        # are no AlayaCare entries, and the export has never been wired
+        # (/data/hermes/imports does not exist). The detectors that need it
+        # are therefore opt-in, not broken: skip quietly with the reason on
+        # the run log instead of raising every run about a feed that is not
+        # coming. Pointing ALAYACARE_* at a real CSV re-enables them with no
+        # code change.
+        print(
+            f"[alayacare] skipped — no export at {ac.path}; hourly-shape "
+            "detectors (ghost-shift, overtime-spike, utilisation-drop, "
+            "broken-shift-trigger) not run (detector is opt-in)"
+        )
 
     if not myob.lines:
         return findings  # nothing to analyse beyond ingest signals

@@ -282,7 +282,17 @@ def _gather_findings() -> tuple[list[dict[str, Any]], bool]:
         csv_path = os.environ.get("ALAYACARE_SERVICE_EXPORT", "")
     load = alayacare_csv.load(csv_path)
     if load.missing:
-        findings.append(_alayacare_missing_finding(csv_path))
+        # AlayaCare export is NOT available — Tony confirmed 2 Aug 2026 there
+        # are no AlayaCare entries, and the export has never been wired
+        # (/data/hermes/imports does not exist). The detectors that need it
+        # are therefore opt-in, not broken: skip quietly with the reason on
+        # the run log instead of raising every run about a feed that is not
+        # coming. Pointing ALAYACARE_* at a real CSV re-enables them with no
+        # code change.
+        print(
+            f"[alayacare] skipped — no export at {csv_path or '<unset>'}; "
+            "leakage, pricing and budget detectors not run (opt-in)"
+        )
         return findings, True
 
     services = load.services
