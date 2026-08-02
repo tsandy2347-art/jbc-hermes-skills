@@ -77,21 +77,23 @@ def run_intercompany(*, tolerance_aud: float) -> list[dict[str, Any]]:
     cq_code = os.environ.get("XERO_CQ_LOAN_FROM_SC_CODE", "").strip()
 
     if not sc_code or not cq_code:
-        findings.append({
-            "detector": "intercompany-codes-not-configured",
-            "domain": "intercompany",
-            "severity": "critical",
-            "entity_code": "SC",
-            "title": "Intercompany account codes not configured",
-            "detail": "XERO_SC_LOAN_TO_CQ_CODE and/or XERO_CQ_LOAN_FROM_SC_CODE are unset. "
-                      "Intercompany reconciliation is SKIPPED until codes are configured.",
-            "amount": None,
-            "evidence": {
-                "dedupKey": "intercompany-codes-not-configured",
-                "kind": "intercompany-codes-not-configured",
-                "scCode": sc_code or None, "cqCode": cq_code or None,
-            },
-        })
+        # Intercompany reconciliation is OPT-IN: it only works once someone
+        # names the two loan account codes. Unset means "not turned on", which
+        # is a configuration choice, not a control failure — so it is skipped
+        # quietly rather than raised as a critical finding every single day.
+        #
+        # It used to emit a critical, which then sat in the brief's coverage
+        # section as a 65-day "chronic blind spot" (Tony, 2 Aug 2026: take it
+        # out). A daily alarm about an unconfigured optional feature trains
+        # people to skim the section that is supposed to be unskimmable.
+        #
+        # Setting XERO_SC_LOAN_TO_CQ_CODE and XERO_CQ_LOAN_FROM_SC_CODE turns
+        # it back on with no code change. The skip is logged to the run output
+        # so it stays discoverable without being noise.
+        print(
+            "[intercompany] skipped — XERO_SC_LOAN_TO_CQ_CODE / "
+            "XERO_CQ_LOAN_FROM_SC_CODE unset (detector is opt-in)"
+        )
         return findings
 
     try:
