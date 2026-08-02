@@ -33,7 +33,32 @@ from scripts.detectors import aging as aging_detectors         # noqa: E402
 from scripts.detectors import cash as cash_detectors           # noqa: E402
 from scripts.detectors import debtors as debtor_detectors      # noqa: E402
 
+# Resolve-on-absence lives in the shared lib so all seven runners close findings
+# by the same rule. Without it nothing ever leaves the findings table.
+if "/data/hermes/lib" not in sys.path:
+    sys.path.insert(0, "/data/hermes/lib")
+try:
+    from findings_sweep import identity_of, resolve_absent  # noqa: E402
+    _SWEEP_AVAILABLE = True
+except ImportError:  # shared lib not installed — run without sweeping
+    _SWEEP_AVAILABLE = False
+
 SOURCE_AGENT = "receivables"
+
+# Detectors whose output is a COMPLETE current-state snapshot each run.
+# Only these are eligible for resolve-on-absence; point-in-time event
+# detectors are omitted on purpose (see lib/findings_sweep.py).
+STATE_DETECTORS = [
+    "invoice-60-plus",
+    "invoice-90-plus",
+    "writeoff-candidate",
+    "part-payment",
+    "ar-total",
+    "ar-aging-buckets",
+    "ar-collections-weekly",
+    "debtor-exposure-breach",
+]
+
 
 
 # ── DB helpers ────────────────────────────────────────────────────────
@@ -295,7 +320,7 @@ def _ingest_failure(entity: str, label: str, exc: BaseException) -> dict[str, An
         ),
         "amount": None,
         "evidence": {
-            "dedupKey": f"receivables-{label}-failed:{entity}:{today_iso}",
+            "dedupKey": f"receivables-{label}-failed:{entity}",
             "kind": "ingest-failure",
             "error": str(exc),
             "traceback": traceback.format_exc(limit=4),
@@ -400,7 +425,7 @@ def _run_for_entity(entity: str, *, now: _dt.datetime,
             ),
             "amount": round(d61_90 + d90plus, 2),
             "evidence": {
-                "dedupKey":      f"ar-aging-buckets:{entity}:{today_iso}",
+                "dedupKey":      f"ar-aging-buckets:{entity}",
                 "current":       round(bkt["current"], 2),
                 "d1to30":        round(bkt["1-30"], 2),
                 "d31to60":       round(bkt["31-60"], 2),
@@ -445,7 +470,7 @@ def _run_for_entity(entity: str, *, now: _dt.datetime,
             ),
             "amount": round(cash_collected, 2),
             "evidence": {
-                "dedupKey":          f"ar-collections-weekly:{entity}:{today_iso}",
+                "dedupKey":          f"ar-collections-weekly:{entity}",
                 "cashCollected":     round(cash_collected, 2),
                 "paymentCount":      len(weekly_payments),
                 "newInvoicedAmount": round(new_invoice_amount, 2),
@@ -473,7 +498,7 @@ def _run_for_entity(entity: str, *, now: _dt.datetime,
             ),
             "amount": round(total_outstanding, 2),
             "evidence": {
-                "dedupKey":      f"ar-total:{entity}:{today_iso}",
+                "dedupKey":      f"ar-total:{entity}",
                 "totalOutstanding": round(total_outstanding, 2),
                 "invoiceCount":  total_invoices,
                 "asOf":          today_iso,
@@ -548,6 +573,28 @@ def main() -> int:
                     "warn": "persist-failed", "error": str(exc),
                     "finding": {k: f.get(k) for k in ("detector", "entity_code")},
                 }))
+
+        # Close what this run no longer sees. A run carrying any ingest failure
+        # sweeps nothing — see lib/findings_sweep.py for why that matters.
+        had_failures = any(
+            f.get("detector") == "ingest-failure" or f.get("domain") == "ingest"
+            for f in findings
+        )
+        sweep = {"swept": False, "reason": "findings_sweep unavailable", "resolved": 0}
+        if _SWEEP_AVAILABLE:
+            try:
+                sweep = resolve_absent(
+                    conn,
+                    source_agent=SOURCE_AGENT,
+                    run_id=run_id,
+                    emitted=[identity_of(SOURCE_AGENT, f) for f in findings],
+                    had_failures=had_failures,
+                    state_detectors=STATE_DETECTORS,
+                )
+            except Exception as exc:  # noqa: BLE001
+                traceback.print_exc()
+                sweep = {"swept": False, "reason": f"sweep crashed: {exc}", "resolved": 0}
+        print(json.dumps({"sweep": sweep}))
 
         status = "exceptions" if findings else "ok"
         _update_audit_run_end(

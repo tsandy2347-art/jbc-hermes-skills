@@ -172,7 +172,7 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
             "detail": f"Xero Invoices endpoint (ACCPAY) failed: {exc}.",
             "amount": None,
             "evidence": {
-                "dedupKey": f"paid-invoice-consistency-failed:{entity}:{today_iso}",
+                "dedupKey": f"paid-invoice-consistency-failed:{entity}",
                 "kind": "ingest-failure",
                 "error": str(exc),
             },

@@ -30,7 +30,24 @@ from scripts.detectors import leakage as leakage_detector   # noqa: E402
 from scripts.detectors import pricing as pricing_detector   # noqa: E402
 from scripts.detectors import budgets as budgets_detector   # noqa: E402
 
+# Resolve-on-absence lives in the shared lib so all seven runners close findings
+# by the same rule. Without it nothing ever leaves the findings table.
+if "/data/hermes/lib" not in sys.path:
+    sys.path.insert(0, "/data/hermes/lib")
+try:
+    from findings_sweep import identity_of, resolve_absent  # noqa: E402
+    _SWEEP_AVAILABLE = True
+except ImportError:  # shared lib not installed — run without sweeping
+    _SWEEP_AVAILABLE = False
+
 SOURCE_AGENT = "revenue-claims"
+
+# Detectors whose output is a COMPLETE current-state snapshot each run.
+# Only these are eligible for resolve-on-absence; point-in-time event
+# detectors are omitted on purpose (see lib/findings_sweep.py).
+STATE_DETECTORS = [
+]
+
 
 
 def _db_url() -> str:
@@ -213,7 +230,7 @@ def _ingest_failure(entity: str, label: str, exc: BaseException) -> dict[str, An
         "detail": f"Detector failed mid-run: {exc}. Investigate connectivity and credentials.",
         "amount": None,
         "evidence": {
-            "dedupKey": f"{label}-detector-failed:{entity}:{today_iso}",
+            "dedupKey": f"{label}-detector-failed:{entity}",
             "kind": "ingest-failure",
             "error": str(exc),
             "traceback": traceback.format_exc(limit=4),
@@ -239,7 +256,7 @@ def _alayacare_missing_finding(path: str) -> dict[str, Any]:
         ),
         "amount": None,
         "evidence": {
-            "dedupKey": f"alayacare-export-missing:{today_iso}",
+            "dedupKey": f"alayacare-export-missing",
             "kind": "alayacare-export-missing",
             "csvSource": path or "",
         },
@@ -293,7 +310,7 @@ def _gather_findings() -> tuple[list[dict[str, Any]], bool]:
                 ),
                 "amount": None,
                 "evidence": {
-                    "dedupKey": f"xero-not-configured:{entity}:{today_iso}",
+                    "dedupKey": f"xero-not-configured:{entity}",
                     "kind": "xero-not-configured",
                 },
             })
@@ -363,6 +380,28 @@ def main() -> int:
                 traceback.print_exc()
                 print(json.dumps({"warn": "persist-failed", "error": str(exc),
                                   "finding": {k: f.get(k) for k in ("detector", "entity_code")}}))
+
+        # Close what this run no longer sees. A run carrying any ingest failure
+        # sweeps nothing — see lib/findings_sweep.py for why that matters.
+        had_failures = any(
+            f.get("detector") == "ingest-failure" or f.get("domain") == "ingest"
+            for f in findings
+        )
+        sweep = {"swept": False, "reason": "findings_sweep unavailable", "resolved": 0}
+        if _SWEEP_AVAILABLE:
+            try:
+                sweep = resolve_absent(
+                    conn,
+                    source_agent=SOURCE_AGENT,
+                    run_id=run_id,
+                    emitted=[identity_of(SOURCE_AGENT, f) for f in findings],
+                    had_failures=had_failures,
+                    state_detectors=STATE_DETECTORS,
+                )
+            except Exception as exc:  # noqa: BLE001
+                traceback.print_exc()
+                sweep = {"swept": False, "reason": f"sweep crashed: {exc}", "resolved": 0}
+        print(json.dumps({"sweep": sweep}))
 
         status = "exceptions" if findings else "ok"
         _update_audit_run_end(

@@ -62,6 +62,54 @@ def _low_cash_threshold(entity: str) -> float | None:
         return None
 
 
+# Which accounts constitute each entity's "cash position" — the Westpac
+# operating accounts only, per Tony (2026-07-08): credit cards and
+# participant/trust (Vasco) balances are excluded so the number is JBC's own
+# operating cash. Matched by name substring (the embedded account number keeps
+# it unambiguous). Overridable via RECON_CASH_ACCOUNTS_<ENTITY> (comma-sep).
+_CASH_ACCOUNT_DEFAULTS = {
+    "SC": ["Main Acc 1205", "NDIS Acc 1432", "HCP Acc 1440"],
+    "CQ": ["Business One"],
+}
+
+
+def _cash_account_patterns(entity: str) -> list[str]:
+    raw = os.environ.get(f"RECON_CASH_ACCOUNTS_{entity.upper()}")
+    if raw:
+        return [p.strip() for p in raw.split(",") if p.strip()]
+    return _CASH_ACCOUNT_DEFAULTS.get(entity.upper(), [])
+
+
+def _is_cash_account(entity: str, name: str) -> bool:
+    n = _norm(name)
+    return any(_norm(p) in n for p in _cash_account_patterns(entity))
+
+
+def _norm(s: Any) -> str:
+    """Collapse whitespace + lowercase for tolerant name comparison."""
+    return " ".join(str(s or "").split()).strip().lower()
+
+
+def _name_matches(report_name: str, account_name: str) -> bool:
+    """Match a BankSummary row name to an Accounts-endpoint account name.
+
+    Xero's BankSummary report TRUNCATES account names to ~30 chars and carries
+    NO account-id attribute, so the old exact-name / by-id match dropped ~40%
+    of accounts (every long-named account → false "balance unavailable"). The
+    report name is a leading prefix of the full account name, so we match on:
+      - exact (after whitespace/case normalisation), or
+      - the full account name STARTS WITH the (truncated) report name.
+    A minimum length guards against a short generic name ("Credit Card")
+    prefix-matching the wrong row.
+    """
+    rn, an = _norm(report_name), _norm(account_name)
+    if not rn or not an:
+        return False
+    if rn == an:
+        return True
+    return len(rn) >= 8 and an.startswith(rn)
+
+
 def _find_balance(rows: list[dict[str, Any]], account_id: str, account_name: str) -> float | None:
     for row in rows or []:
         if row.get("Rows"):
@@ -74,9 +122,12 @@ def _find_balance(rows: list[dict[str, Any]], account_id: str, account_name: str
                 continue
             first = cells[0]
             attrs = first.get("Attributes") or []
-            by_id = any(a.get("Id") == "account" and a.get("Value") == account_id for a in attrs)
-            by_name = first.get("Value") == account_name
-            if by_id or by_name:
+            # by_id kept for forward-compat, but BankSummary currently emits no
+            # account-id attribute, so the name match below is what actually works.
+            by_id = bool(account_id) and any(
+                a.get("Id") == "account" and a.get("Value") == account_id for a in attrs
+            )
+            if by_id or _name_matches(first.get("Value", ""), account_name):
                 # Closing balance is the last numeric cell.
                 for i in range(len(cells) - 1, -1, -1):
                     v = cells[i].get("Value", "")
@@ -122,7 +173,7 @@ def run_bank(entity: str, *, lookback_days: int = 0, unmatched_days: int = 0) ->
             "title": f"{entity}: bank accounts could not be listed",
             "detail": f"Xero Accounts endpoint failed: {exc}. Treat as eyes-on until resolved.",
             "amount": None,
-            "evidence": {"dedupKey": f"bank-list-failed:{entity}:{today_iso}",
+            "evidence": {"dedupKey": f"bank-list-failed:{entity}",
                          "kind": "balance-unavailable", "error": str(exc)},
         })
         return findings
@@ -133,8 +184,15 @@ def run_bank(entity: str, *, lookback_days: int = 0, unmatched_days: int = 0) ->
         bs = None
 
     low_cash = _low_cash_threshold(entity)
+    cash_parts: list[tuple[str, float]] = []  # (name, balance) for cash-position
 
     for acc in accounts:
+        # Archived accounts appear in the CoA but not in BankSummary — matching
+        # them always fails and yields a false "balance unavailable". Skip them;
+        # the auto-resolve sweep clears any lingering finding for the account.
+        if str(acc.get("Status", "")).upper() == "ARCHIVED":
+            continue
+
         acc_id = acc.get("AccountID", "")
         name = acc.get("Name", "(unnamed)")
         masked = mask_account(acc.get("BankAccountNumber"))
@@ -142,14 +200,21 @@ def run_bank(entity: str, *, lookback_days: int = 0, unmatched_days: int = 0) ->
 
         balance = _extract_balance(bs, acc)
         if balance is None:
+            # The account has no row in BankSummary — Xero only lists accounts
+            # with activity in the window, so this is almost always a dormant /
+            # zero-activity account, NOT a monitoring failure. Emit a low-severity
+            # note (never a critical "eyes-on") so it can't masquerade as a cash
+            # emergency; a genuinely live account showing up here is worth a
+            # manual glance but is not today's headline.
             findings.append({
                 "detector": "balance-unavailable",
                 "domain": "bank",
-                "severity": "critical",
+                "severity": "info",
                 "entity_code": entity,
-                "title": f"{name} {masked} — balance unavailable",
-                "detail": "Could not derive the current balance from Xero BankSummary. "
-                          "Treat as eyes-on until resolved.",
+                "title": f"{name} {masked} — no recent activity",
+                "detail": "No entry in Xero BankSummary for the reporting window — "
+                          "likely a dormant or zero-activity account. Confirm manually "
+                          "only if this account should be transacting.",
                 "amount": None,
                 "evidence": {
                     "dedupKey": f"balance-unavailable:{entity}:{acc_id}",
@@ -158,6 +223,8 @@ def run_bank(entity: str, *, lookback_days: int = 0, unmatched_days: int = 0) ->
                 },
             })
         else:
+            if _is_cash_account(entity, name):
+                cash_parts.append((name, balance))
             overdrawn = balance < 0
             if overdrawn and not is_cc:
                 findings.append({
@@ -193,5 +260,27 @@ def run_bank(entity: str, *, lookback_days: int = 0, unmatched_days: int = 0) ->
                 })
 
         # stale-unreconciled removed — see module docstring for why.
+
+    # ── Cash position: the entity's Westpac operating accounts, summed. ──
+    # Info-severity data finding consumed by Mark's brief "CASH POSITION"
+    # panel (recentCashByEntity). NOT an exception — brief.ts excludes the
+    # cash-position detector from the action pipeline so it never headlines.
+    if cash_parts:
+        total = sum(b for _, b in cash_parts)
+        breakdown = "; ".join(f"{nm}: {_fmt_aud(bal)}" for nm, bal in cash_parts)
+        findings.append({
+            "detector": "cash-position",
+            "domain": "bank",
+            "severity": "info",
+            "entity_code": entity,
+            "title": f"{entity} cash position: {_fmt_aud(total)}",
+            "detail": f"Sum of Westpac operating accounts ({len(cash_parts)}): {breakdown}.",
+            "amount": total,
+            "evidence": {
+                "dedupKey": f"cash-position:{entity}",
+                "kind": "cash-position",
+                "accounts": [{"name": nm, "balance": bal} for nm, bal in cash_parts],
+            },
+        })
 
     return findings

@@ -68,7 +68,7 @@ def detect_labour_cost_pct(lines: Iterable[Any],
             ),
             "amount": cost,
             "evidence": {
-                "dedupKey": f"labour-cost-pct:{entity}:{today_iso_period}",
+                "dedupKey": f"labour-cost-pct:{entity}",
                 "entityCode": entity, "labourCost": cost, "revenue": rev,
                 "pct": pct, "target": targets.get(entity),
             },

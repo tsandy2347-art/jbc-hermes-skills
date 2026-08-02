@@ -147,7 +147,7 @@ def run_intercompany(*, tolerance_aud: float) -> list[dict[str, Any]]:
             "evidence": {
                 # Daily dedupKey — keeps a row per day so the trend is visible
                 # rather than a single perpetually-open finding.
-                "dedupKey": f"intercompany-mismatch:{today_iso}",
+                "dedupKey": f"intercompany-mismatch",
                 "kind": "intercompany-mismatch",
                 "scCode": sc_code, "cqCode": cq_code,
                 "scBalance": sc_balance, "cqBalance": cq_balance,

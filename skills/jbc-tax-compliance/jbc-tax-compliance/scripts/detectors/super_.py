@@ -81,7 +81,7 @@ def run_super(entity: str) -> list[dict[str, Any]]:
                 f"on the chart of accounts. Confirm the codes are correct."
             ),
             "evidence": {
-                "dedupKey": f"super-clearing-position:{entity}:{today.isoformat()}",
+                "dedupKey": f"super-clearing-position:{entity}",
                 "entityCode": entity,
                 "codesTried": codes,
                 **ruleset_meta(),
@@ -103,7 +103,7 @@ def run_super(entity: str) -> list[dict[str, Any]]:
         ),
         "amount": round(total * 100) / 100,
         "evidence": {
-            "dedupKey": f"super-clearing-position:{entity}:{today.isoformat()}",
+            "dedupKey": f"super-clearing-position:{entity}",
             "entityCode": entity,
             "asAt": today.isoformat(),
             "totalAbs": round(total * 100) / 100,

@@ -69,7 +69,7 @@ def run_journal(
             "title": f"{entity}: ManualJournals endpoint failed",
             "detail": f"Could not list manual journals from Xero: {exc}",
             "amount": None,
-            "evidence": {"dedupKey": f"mj-list-failed:{entity}:{today_iso}",
+            "evidence": {"dedupKey": f"mj-list-failed:{entity}",
                          "error": str(exc)},
         })
         manuals = []
@@ -145,7 +145,7 @@ def run_journal(
             ),
             "amount": None,
             "evidence": {
-                "dedupKey": f"late-posted-aggregate:{entity}:{today_iso}",
+                "dedupKey": f"late-posted-aggregate:{entity}",
                 "kind": "late-posted-journals",
                 "totalCount": len(lagged),
                 "lagThresholdBusinessDays": lag_days,

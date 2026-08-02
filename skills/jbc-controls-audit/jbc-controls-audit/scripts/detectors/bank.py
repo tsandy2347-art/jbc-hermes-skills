@@ -128,7 +128,7 @@ def run_bank(entity: str) -> list[dict[str, Any]]:
             "detail": f"Xero Contacts endpoint failed: {exc}.",
             "amount": None,
             "evidence": {
-                "dedupKey": f"bank-detector-failed:{entity}:{today_iso}",
+                "dedupKey": f"bank-detector-failed:{entity}",
                 "kind": "ingest-failure",
                 "error": str(exc),
             },

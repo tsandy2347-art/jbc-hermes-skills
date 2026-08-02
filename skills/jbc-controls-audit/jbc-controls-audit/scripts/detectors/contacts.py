@@ -85,7 +85,7 @@ def run_contacts(entity: str) -> list[dict[str, Any]]:
             "detail": f"Xero Contacts endpoint failed: {exc}.",
             "amount": None,
             "evidence": {
-                "dedupKey": f"contacts-detector-failed:{entity}:{today_iso}",
+                "dedupKey": f"contacts-detector-failed:{entity}",
                 "kind": "ingest-failure",
                 "error": str(exc),
             },
@@ -130,7 +130,7 @@ def run_contacts(entity: str) -> list[dict[str, Any]]:
             ),
             "amount": None,
             "evidence": {
-                "dedupKey": f"no-abn-aggregate:{entity}:{today_iso}",
+                "dedupKey": f"no-abn-aggregate:{entity}",
                 "kind": "no-abn-aggregate",
                 "missingCount": len(no_abn),
                 "invalidCount": len(invalid_abn),

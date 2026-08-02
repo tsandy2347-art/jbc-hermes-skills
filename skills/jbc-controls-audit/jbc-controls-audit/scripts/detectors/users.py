@@ -44,7 +44,7 @@ def run_users(entity: str) -> list[dict[str, Any]]:
             "detail": f"Xero Users endpoint failed: {exc}.",
             "amount": None,
             "evidence": {
-                "dedupKey": f"users-detector-failed:{entity}:{today_iso}",
+                "dedupKey": f"users-detector-failed:{entity}",
                 "kind": "ingest-failure",
                 "error": str(exc),
             },
@@ -88,7 +88,7 @@ def run_users(entity: str) -> list[dict[str, Any]]:
         ),
         "amount": None,
         "evidence": {
-            "dedupKey": f"elevated-user-roster:{entity}:{today_iso}",
+            "dedupKey": f"elevated-user-roster:{entity}",
             "kind": "elevated-user-roster",
             "count": len(elevated),
             "users": full_entries,

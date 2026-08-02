@@ -76,7 +76,7 @@ def run_payment_run(entity: str, *, lookback_days: int) -> list[dict[str, Any]]:
         ),
         "amount": round(total, 2),
         "evidence": {
-            "dedupKey": f"payment-run-proposed:{entity}:{today_iso}",
+            "dedupKey": f"payment-run-proposed:{entity}",
             "kind": "payment-run-proposed",
             "entityCode": entity,
             "leadDays": lead_days,
