@@ -98,6 +98,88 @@ def _derive_cash_set_aside(report: dict[str, Any] | None,
     return _round2(total) if found else None
 
 
+def _ledger_gst_position(entity: str, *, today: _dt.date, period: Any,
+                         accounts: list[dict[str, Any]], codes: list[str],
+                         ledger_balance: float | None, lookback_days: int,
+                         meta: dict[str, Any]) -> dict[str, Any]:
+    """gst-position from the GST control account alone.
+
+    The control account balance today is everything not yet paid to the ATO,
+    not the open period's GST. Until 5 Oct 2026 it was labelled with the open
+    period, so four days into Q2 the brief showed "$299,594 owed for Q2" —
+    really Q1's unpaid GST — and never mentioned that Q1's BAS was due 28 Oct.
+
+    So between a period closing and its BAS due date, report the closed
+    period: the control balance at its last day, with the due date in the
+    label (Mark renders "owed for <label>"). After the due date, report the
+    balance accrued so far in the open period.
+    """
+    cycle = _bas_cycle(entity)
+    prev = bas_period_for(period.start - _dt.timedelta(days=1), cycle)
+    closing: float | None = None
+    if today <= prev.due_date:
+        closing = _derive_cash_set_aside(
+            xero_tax.trial_balance(entity, prev.end.isoformat()), accounts, codes,
+        )
+    current_txt = f"${(ledger_balance or 0):,.2f}"
+
+    if closing is not None:
+        shown, amount = prev, closing
+        label = f"{prev.label} — BAS due {prev.due_date.day} {prev.due_date:%b}"
+        title = (f"[{entity}] BAS {prev.label} due {prev.due_date.isoformat()}: "
+                 f"${closing:,.2f} GST (control account at {prev.end.isoformat()})")
+        detail_head = (
+            f"{entity} GST control-account balance at the close of {prev.label} "
+            f"({prev.end.isoformat()}): ${closing:,.2f}. BAS due "
+            f"{prev.due_date.isoformat()}.\n"
+            f"  Unpaid GST in the ledger today: {current_txt} (closed period plus "
+            f"{period.label} to date, less anything already paid).\n"
+        )
+    else:
+        shown, amount = period, ledger_balance
+        label = f"{period.label} to date"
+        title = (f"[{entity}] GST accrued {period.label} to date: {current_txt} "
+                 f"(ledger balance)")
+        detail_head = (
+            f"{entity} GST control-account balance today: {current_txt}.\n"
+            f"  Period: {period.start.isoformat()} → {period.end.isoformat()}\n"
+            f"  Due:    {period.due_date.isoformat()}\n"
+        )
+
+    return {
+        "detector": "gst-position",
+        "domain": "gst",
+        "severity": "info",
+        "entity_code": entity,
+        "title": title,
+        "detail": (
+            detail_head
+            + "  The control-account balance approximates the BAS figure; "
+            "the lodged BAS is the source of truth. Sales/purchases breakdown "
+            "and coding-anomaly checks are unavailable — they need "
+            "accounting.journals.read, which Xero gates behind the Advanced "
+            "tier + approval (not currently granted)."
+        ),
+        "amount": amount,
+        "evidence": {
+            "dedupKey": f"gst-position:{entity}:{shown.label}",
+            "entityCode": entity,
+            "period": {
+                "start": shown.start.isoformat(),
+                "end": shown.end.isoformat(),
+                "label": label,
+                "dueIso": shown.due_date.isoformat(),
+            },
+            "netGst": amount,
+            "ledgerBalanceToday": ledger_balance,
+            "closedPeriodBalance": closing,
+            "source": "trial-balance-control-account",
+            "breakdownAvailable": False,
+            "lookbackDays": lookback_days,
+            **meta,
+        },
+    }
+
 def run_gst(entity: str, *, lookback_days: int) -> list[dict[str, Any]]:
     """Pull a per-entity Xero snapshot and emit all GST findings."""
     if not xero_tax.tenant_configured(entity):
@@ -124,42 +206,11 @@ def run_gst(entity: str, *, lookback_days: int) -> list[dict[str, Any]]:
         # ledger-only net GST figure straight off the control account
         # balance. Still live, still current, just no sales/purchases split
         # and no journal-dependent anomaly checks below.
-        out.append({
-            "detector": "gst-position",
-            "domain": "gst",
-            "severity": "info",
-            "entity_code": entity,
-            "title": (
-                f"[{entity}] Live GST position {period.label}: "
-                f"${(ledger_balance or 0):.2f} owed (ledger balance)"
-            ),
-            "detail": (
-                f"{entity} GST control-account balance for {period.label}: "
-                f"${(ledger_balance or 0):.2f}.\n"
-                f"  Period: {period.start.isoformat()} → {period.end.isoformat()}\n"
-                f"  Due:    {period.due_date.isoformat()}\n"
-                f"  Sales/purchases breakdown and coding-anomaly checks are "
-                f"unavailable — they need accounting.journals.read, which "
-                f"Xero gates behind the Advanced tier + approval (not "
-                f"currently granted)."
-            ),
-            "amount": ledger_balance,
-            "evidence": {
-                "dedupKey": f"gst-position:{entity}:{period.label}",
-                "entityCode": entity,
-                "period": {
-                    "start": period.start.isoformat(),
-                    "end": period.end.isoformat(),
-                    "label": period.label,
-                    "dueIso": period.due_date.isoformat(),
-                },
-                "netGst": ledger_balance,
-                "source": "trial-balance-control-account",
-                "breakdownAvailable": False,
-                "lookbackDays": lookback_days,
-                **meta,
-            },
-        })
+        out.append(_ledger_gst_position(
+            entity, today=today, period=period, accounts=accounts,
+            codes=codes, ledger_balance=ledger_balance,
+            lookback_days=lookback_days, meta=meta,
+        ))
         return out
 
     tax_types = xero_tax.aggregate_tax_types(journals)

@@ -83,9 +83,38 @@ def list_unreconciled_bank_transactions(
 
 
 def list_manual_journals(entity: str) -> list[dict[str, Any]]:
-    """All recent manual journals (DRAFT + POSTED + VOIDED)."""
-    data = _get(entity, "ManualJournals")
-    return list(data.get("ManualJournals") or [])
+    """All manual journals (DRAFT + POSTED + VOIDED), with lines.
+
+    Paged on purpose: Xero only includes JournalLines when `page` is passed.
+    Unpaged, every journal priced at $0 — which put A$0.00 on the payroll
+    drafts and meant large-posted-journal could never fire.
+    """
+    results: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        data = _get(entity, "ManualJournals", params={"page": page})
+        chunk = list(data.get("ManualJournals") or [])
+        if not chunk:
+            break
+        results.extend(chunk)
+        if len(chunk) < 100:
+            break
+        page += 1
+        if page > 50:  # safety
+            break
+    return results
+
+
+def get_manual_journal(entity: str, manual_journal_id: str) -> dict[str, Any] | None:
+    """One manual journal WITH its lines.
+
+    The unpaged ManualJournals list comes back without JournalLines, so every
+    draft priced off the list read A$0.00 with 0 lines (seen on all four payroll
+    drafts, Oct 2026). Fetching by id returns the lines.
+    """
+    data = _get(entity, f"ManualJournals/{manual_journal_id}")
+    rows = list(data.get("ManualJournals") or [])
+    return rows[0] if rows else None
 
 
 def list_recent_journals(entity: str, offset: int = 0) -> list[dict[str, Any]]:

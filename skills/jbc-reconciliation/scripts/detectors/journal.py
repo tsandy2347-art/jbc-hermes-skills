@@ -12,7 +12,12 @@ import datetime as _dt
 import os
 from typing import Any
 
-from ..xero_client import list_manual_journals, list_recent_journals, parse_xero_date
+from ..xero_client import (
+    get_manual_journal,
+    list_manual_journals,
+    list_recent_journals,
+    parse_xero_date,
+)
 
 
 def _fmt_aud(n: float) -> str:
@@ -79,9 +84,21 @@ def run_journal(
         if j.get("Status") != "DRAFT":
             continue
         mj_id = j.get("ManualJournalID", "")
+        # The list omits lines — fetch the draft itself so the amount is real.
+        # If that call fails, say the amount is unknown rather than print $0.
+        lines_known = bool(j.get("JournalLines"))
+        if not lines_known and mj_id:
+            try:
+                full = get_manual_journal(entity, mj_id)
+            except Exception:  # noqa: BLE001
+                full = None
+            if full and full.get("JournalLines"):
+                j = {**j, "JournalLines": full["JournalLines"]}
+                lines_known = True
         d = parse_xero_date(j.get("Date"))
         age = _business_days_between(d, today) if d else 0
-        amount = _mj_amount(j)
+        amount = _mj_amount(j) if lines_known else None
+        amount_txt = _fmt_aud(amount) if amount is not None else "amount unknown"
         narration = (j.get("Narration") or "").strip() or "(no narration)"
         trunc = narration if len(narration) <= 80 else narration[:77] + "…"
         line_count = len(j.get("JournalLines") or [])
@@ -92,10 +109,10 @@ def run_journal(
             "domain": "journal",
             "severity": "critical" if age > 5 else "warning",
             "entity_code": entity,
-            "title": f"Unposted manual journal — {trunc} ({_fmt_aud(amount)}, {age}d old)",
+            "title": f"Unposted manual journal — {trunc} ({amount_txt}, {age}d old)",
             "detail": (
                 "Draft journals sit outside the GL and skew month-to-date figures. "
-                f"Narration: \"{narration}\". Amount: {_fmt_aud(amount)}. {line_count} line(s). "
+                f"Narration: \"{narration}\". Amount: {amount_txt}. {line_count} line(s). "
                 f"Oldest line date {age} business day(s) ago. Open in Xero to post or void: {link}"
             ),
             "amount": amount,
@@ -155,8 +172,20 @@ def run_journal(
         })
 
     # 3. Large posted manual journals — one finding per MJ.
+    # Until Oct 2026 the list carried no lines, every amount read $0 and this
+    # never fired. Now that it can, keep it to recent journals and leave out
+    # the weekly payroll journals (always over threshold, built by
+    # create-payroll-journal and reviewed when a human posts them) — otherwise
+    # it would raise one finding per payroll journal ever posted.
+    window_days = int(os.environ.get("RECON_LARGE_JOURNAL_WINDOW_DAYS", "14"))
+    window_start = today.date() - _dt.timedelta(days=window_days)
     for j in manuals:
         if j.get("Status") != "POSTED":
+            continue
+        jd = parse_xero_date(j.get("Date"))
+        if not jd or jd.date() < window_start:
+            continue
+        if (j.get("Narration") or "").lstrip().lower().startswith("payroll pay run"):
             continue
         amount = _mj_amount(j)
         if amount < large_threshold_aud:

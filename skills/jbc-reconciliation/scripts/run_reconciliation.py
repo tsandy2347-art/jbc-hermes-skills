@@ -53,6 +53,12 @@ STATE_DETECTORS = [
     "cash-position",
     "unposted-manual-journal",
     "late-posted-aggregate",
+    # The sweep matches on detector name; "late-posted-aggregate" above is the
+    # dedupKey prefix, so the aggregate was never actually swept.
+    "late-posted-journal",
+    # A review prompt over a rolling window, not an open problem: once the
+    # journal ages out of RECON_LARGE_JOURNAL_WINDOW_DAYS it should drop off.
+    "large-posted-journal",
     "intercompany-codes-not-configured",
     "intercompany-mismatch",
     # Detector-failure findings are state too: if the check runs clean
