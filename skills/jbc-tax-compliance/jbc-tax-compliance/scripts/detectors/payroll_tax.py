@@ -14,8 +14,9 @@ WHAT IT ALERTS ON (rewritten Oct 2026)
 
   Being over the threshold is not news. What would be news is payroll tax
   not being paid, so the warning conditions are:
-    1. no payroll-tax expense booked for the last month that should have
-       one (a missed monthly return), or
+    1. an entity's payroll-tax expense for the last month that should have
+       one is under TAX_PAYROLL_TAX_MIN_MONTH_FRACTION (default 25%) of its
+       12-month monthly average (a missed or unbooked monthly return), or
     2. the effective rate paid over 12 months (paid / wages) falling below
        TAX_PAYROLL_TAX_MIN_EFFECTIVE_RATE (default 3.5%; JBC runs ~4.7%).
   Otherwise the finding is info with no amount.
@@ -51,6 +52,7 @@ from scripts.jbc_tax_rulesets import (
 from scripts.periods import today_bne
 
 DEFAULT_MIN_EFFECTIVE_RATE = 0.035
+DEFAULT_MIN_MONTH_FRACTION = 0.25
 
 
 def _grouped() -> bool:
@@ -63,6 +65,14 @@ def _min_effective_rate() -> float:
         return float(raw) if raw else DEFAULT_MIN_EFFECTIVE_RATE
     except ValueError:
         return DEFAULT_MIN_EFFECTIVE_RATE
+
+
+def _min_month_fraction() -> float:
+    raw = os.environ.get("TAX_PAYROLL_TAX_MIN_MONTH_FRACTION", "")
+    try:
+        return float(raw) if raw else DEFAULT_MIN_MONTH_FRACTION
+    except ValueError:
+        return DEFAULT_MIN_MONTH_FRACTION
 
 
 def _sum_accounts(entity: str, env_var: str, from_iso: str,
@@ -167,14 +177,27 @@ def _emit(entity_code: str, wages: float, *, period_label: str,
 
     problems: list[str] = []
     # Per entity when grouped: a group total would hide one member's missing
-    # month behind the other's payment.
-    missing = sorted(k for k, v in (month_components or {}).items() if v <= 0)
-    if not month_components and month_paid is not None and month_paid <= 0:
-        missing = [entity_code]
+    # month behind the other's payment. "Missing" is well under a normal
+    # month, not just zero — on 5 Oct 2026 SC showed $47 for August against
+    # a ~$41k average, which a == 0 test would have waved through.
+    per_entity_paid = paid_components or (
+        {entity_code: paid_12mo} if paid_12mo is not None else {})
+    months = month_components or (
+        {entity_code: month_paid} if month_paid is not None else {})
+    floor = _min_month_fraction()
+    missing = sorted(
+        k for k, v in months.items()
+        if v <= 0 or (per_entity_paid.get(k) and v < floor * per_entity_paid[k] / 12)
+    )
     if over_threshold and month and missing:
+        detail = ", ".join(
+            f"{k} {_money(months[k])} vs ~{_money(per_entity_paid[k] / 12)} usual"
+            if per_entity_paid.get(k) else f"{k} {_money(months[k])}"
+            for k in missing
+        )
         problems.append(
-            f"no payroll-tax expense booked for {month_label} "
-            f"({', '.join(missing)}) — the monthly return may not have been lodged"
+            f"payroll-tax expense for {month_label} far below a normal month "
+            f"({detail}) — check the monthly return was lodged and booked"
         )
     if over_threshold and effective is not None and effective < min_rate:
         problems.append(
@@ -189,9 +212,7 @@ def _emit(entity_code: str, wages: float, *, period_label: str,
         # it by what is actually at stake: the shortfall against the floor,
         # plus a typical month for each entity with nothing booked.
         gap = max(0.0, wages * min_rate - paid_12mo) if paid_12mo is not None else 0.0
-        per_entity_paid = paid_components or (
-            {entity_code: paid_12mo} if paid_12mo is not None else {})
-        gap += sum(per_entity_paid.get(k, 0.0) / 12 for k in missing)
+        gap += sum(max(0.0, per_entity_paid.get(k, 0.0) / 12 - months[k]) for k in missing)
         amount = round(gap * 100) / 100 if gap else None
     elif over_threshold and paid_12mo is None:
         severity = "info"

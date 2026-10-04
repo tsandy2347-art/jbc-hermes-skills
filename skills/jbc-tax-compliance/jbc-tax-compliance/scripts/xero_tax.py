@@ -151,6 +151,8 @@ def find_account_balance(report: dict[str, Any] | None,
                 first_val == account_code
                 or first_val.startswith(f"{account_code} ")
                 or first_val.startswith(f"{account_code}-")
+                or first_val.endswith(f"({account_code})")
+                or f" ({account_code})" in first_val
             ):
                 return _cell_amount(cells)
             if account_name and first_val.lower() == account_name.lower():
