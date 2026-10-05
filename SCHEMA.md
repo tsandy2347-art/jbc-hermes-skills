@@ -23,6 +23,7 @@ fleet, plus a few audit/baseline tables that support it.
 | `skills_inventory` | Snapshot of skill files present on the Hermes runtime. | A `hermes-jbc` scanner cron. | Mark's Hermes-activity dashboard. |
 | `contact_bank_snapshots` | Vendor bank-detail baseline. Used by controls-audit to detect changes. | Controls-audit only. | Same. |
 | `contact_master_snapshots` | Last-seen name / email / ABN per supplier (PK entity_code + contact_xero_id). vendor-master-change diffs against it. Created by the detector (added 2026-10-05). | Controls-audit only. | Same. |
+| `supplier_first_seen` | When each supplier contact was first seen (PK entity_code + contact_xero_id; `seeded` marks the bootstrap). new-supplier-quarantine reads it. Created by the detector (added 2026-10-05). | Payables only. | Same. |
 | `vendor_spend_baselines` | Vendor spend baseline. Same purpose, different metric. | Controls-audit only. | Same. |
 | `watched_entities` | Allowlist of legal entities controls-audit is permitted to baseline. | Manually seeded. | Controls-audit only. |
 

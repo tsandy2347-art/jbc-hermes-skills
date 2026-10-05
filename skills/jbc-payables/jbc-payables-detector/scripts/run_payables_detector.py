@@ -55,6 +55,8 @@ STATE_DETECTORS = [
     "gst-inconsistent",
     "approval-pending",
     "payment-run-proposed",
+    "new-supplier-quarantine",
+    "new-supplier-detector-failed",
     # Detector-failure findings are state too: if the check runs clean
     # next time, the 'this is broken' finding must clear itself.
     "ingest-failure",
