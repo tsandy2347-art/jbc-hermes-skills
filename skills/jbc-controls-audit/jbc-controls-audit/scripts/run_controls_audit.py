@@ -65,6 +65,19 @@ SOURCE_AGENT = "controls-audit"
 STATE_DETECTORS = [
     "no-abn",
     "elevated-user-roster",
+    # The paid-invoice-* checks re-read every bill in the
+    # AUDIT_PAID_INVOICE_WINDOW_DAYS window each run, so their output is the
+    # full picture for that window. Swept since Oct 2026: a flag stays for the
+    # whole window (and can be dismissed from the brief link before then), and
+    # drops off once its bills age out — instead of the per-bill rows from
+    # June still sitting in the brief in October. Bank-detail changes are
+    # deliberately NOT here: those never close without a human.
+    "paid-invoice-unlinked",
+    "paid-invoice-amount-drift",
+    "paid-invoice-compliance-lapsed",
+    "paid-invoice-paid-but-returned",
+    "paid-invoice-wrong-entity",
+    "paid-invoice-duplicate-bill",
     # Detector-failure findings are state too: if the check runs clean
     # next time, the 'this is broken' finding must clear itself.
     "bank-detector-failed",

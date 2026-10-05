@@ -211,6 +211,32 @@ def run_gst(entity: str, *, lookback_days: int) -> list[dict[str, Any]]:
             codes=codes, ledger_balance=ledger_balance,
             lookback_days=lookback_days, meta=meta,
         ))
+        # Say the coding checks are not running. Without this, the last
+        # untagged-GST findings from before access lapsed (June 2026) sat in
+        # the brief for months as if current. The -not-configured suffix puts
+        # it under COVERAGE in Mark's brief rather than in the work list.
+        out.append({
+            "detector": "gst-coding-check-not-configured",
+            "domain": "gst",
+            "severity": "info",
+            "entity_code": entity,
+            "title": (
+                f"[{entity}] GST coding check not running — needs Xero journal "
+                f"access (Advanced tier)"
+            ),
+            "detail": (
+                "Untagged-GST and implied-rate checks read Xero journal lines, "
+                "which need accounting.journals.read. That scope is not granted, "
+                "so these checks have not run. The BAS figure above comes from "
+                "the GST control account and is unaffected."
+            ),
+            "amount": None,
+            "evidence": {
+                "dedupKey": f"gst-coding-check-not-configured:{entity}",
+                "entityCode": entity,
+                **meta,
+            },
+        })
         return out
 
     tax_types = xero_tax.aggregate_tax_types(journals)

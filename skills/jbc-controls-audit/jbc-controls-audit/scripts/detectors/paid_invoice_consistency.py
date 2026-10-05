@@ -132,7 +132,23 @@ def _get_snapshot() -> cdb.ComplianceSnapshot | None:
 def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
     snap = _get_snapshot()
     if snap is None:
-        return []
+        # The paid-invoice-* detectors are swept (see run_controls_audit
+        # STATE_DETECTORS), so returning nothing here would read as "all
+        # clear" and close every open one. Say the check did not run instead.
+        return [{
+            "detector": "paid-invoice-consistency-failed",
+            "domain": "ingest",
+            "severity": "warning",
+            "entity_code": entity,
+            "is_people_flag": False,
+            "title": f"{entity}: Xero ↔ compliance check skipped — hub DB not configured",
+            "detail": "COMPLIANCE_DATABASE_URL is not set, so paid bills could not be matched to tickets.",
+            "amount": None,
+            "evidence": {
+                "dedupKey": f"paid-invoice-consistency-failed:{entity}",
+                "kind": "ingest-failure",
+            },
+        }]
 
     today_iso = _dt.date.today().isoformat()
     tolerance = _env_float("AUDIT_PAID_INVOICE_TOLERANCE_AUD", 0.05)
@@ -178,6 +194,9 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
             },
         })
         return findings
+
+    # Unlinked bills are reported per supplier, not per bill (see below).
+    unlinked: dict[tuple[str, str], dict[str, Any]] = {}
 
     # ── per-bill checks ───────────────────────────────────────────
     for b in bills:
@@ -230,57 +249,19 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
             if is_allowlisted and not is_known:
                 continue
 
-            if is_known:
-                subkind = "hub-supplier-bypass"
-                title = (
-                    f"{entity}: hub supplier paid in Xero with no ticket — "
-                    f"{contact_name} (${bill_total:.0f})"
-                )
-                detail = (
-                    f"\"{contact_name}\" is an approved compliance-hub supplier, "
-                    f"but bill {bill_number} for ${bill_total:.2f} (status "
-                    f"{b.get('Status')}) was created/paid in Xero with no ticket "
-                    f"— it bypassed care-partner approval and the supplier "
-                    f"compliance gate. Confirm it was legitimately approved "
-                    f"outside the hub."
-                )
-            else:
-                subkind = "unvetted-vendor"
-                title = (
-                    f"{entity}: payment to unvetted vendor — "
-                    f"{contact_name} (${bill_total:.0f})"
-                )
-                detail = (
-                    f"Bill {bill_number} for ${bill_total:.2f} (status "
-                    f"{b.get('Status')}) was paid to \"{contact_name}\", which "
-                    f"is not in the compliance hub as a supplier and has no "
-                    f"ticket. If this is a participant expense it skipped "
-                    f"compliance vetting entirely; if it's a genuine overhead, "
-                    f"add it to AUDIT_PAID_INVOICE_ALLOWLIST to silence."
-                )
-
-            findings.append({
-                "detector": "paid-invoice-unlinked",
-                "domain": "controls",
-                "severity": "warning",
-                "entity_code": entity,
-                "is_people_flag": False,
-                "title": title,
-                "detail": detail,
-                "amount": bill_total,
-                "evidence": {
-                    "dedupKey": f"paid-invoice-unlinked:{entity}:{bill_id}",
-                    "kind": "paid-invoice-unlinked",
-                    "subkind": subkind,
-                    "xeroBillId": bill_id,
-                    "xeroBillNumber": b.get("InvoiceNumber"),
-                    "xeroContactName": contact_name,
-                    "knownHubSupplier": is_known,
-                    "billDate": b.get("Date"),
-                    "billStatus": b.get("Status"),
-                    "paid": paid,
-                    "billTotal": bill_total,
-                },
+            subkind = "hub-supplier-bypass" if is_known else "unvetted-vendor"
+            g = unlinked.setdefault((subkind, norm or contact_name.lower()), {
+                "subkind": subkind,
+                "contact": contact_name,
+                "bills": [],
+            })
+            g["bills"].append({
+                "xeroBillId": bill_id,
+                "xeroBillNumber": b.get("InvoiceNumber"),
+                "billDate": b.get("Date"),
+                "billStatus": b.get("Status"),
+                "paid": paid,
+                "billTotal": bill_total,
             })
             continue
 
@@ -458,6 +439,65 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
                         ],
                     },
                 })
+
+    # 6 (emit). Unlinked bills — ONE finding per supplier, not per bill.
+    # Until Oct 2026 each bill was its own finding and none ever closed, so
+    # one supplier (JBC's own CBD & North Brisbane office, a recruiter, a
+    # broadband provider) filled the brief with a line per payment going back
+    # months. The group covers the AUDIT_PAID_INVOICE_WINDOW_DAYS window and
+    # is swept: it clears when the supplier is vetted in the hub, is
+    # allowlisted / marked "not a care supplier" from the brief, or its bills
+    # age out of the window.
+    for (subkind, norm_key), g in unlinked.items():
+        contact_name = g["contact"]
+        rows = sorted(g["bills"], key=lambda r: str(r.get("billDate") or ""))
+        total = round(sum(r["billTotal"] for r in rows), 2)
+        n = len(rows)
+        if subkind == "hub-supplier-bypass":
+            title = (
+                f"{entity}: hub supplier paid in Xero with no ticket — "
+                f"{contact_name} ({n} bill{'s' if n != 1 else ''}, ${total:,.0f})"
+            )
+            detail = (
+                f"\"{contact_name}\" is an approved compliance-hub supplier, but "
+                f"{n} bill(s) totalling ${total:,.2f} in the last {window_days} days "
+                f"were created/paid in Xero with no ticket — they bypassed "
+                f"care-partner approval and the supplier compliance gate. Confirm "
+                f"they were legitimately approved outside the hub."
+            )
+        else:
+            title = (
+                f"{entity}: payments to unvetted vendor — {contact_name} "
+                f"({n} bill{'s' if n != 1 else ''}, ${total:,.0f})"
+            )
+            detail = (
+                f"{n} bill(s) totalling ${total:,.2f} in the last {window_days} days "
+                f"went to \"{contact_name}\", which is not a compliance-hub "
+                f"supplier and has no tickets. If it supplies participant "
+                f"services it skipped vetting; if it is a business supplier, "
+                f"tap \"not a care supplier\" on the brief link (or quick-add it "
+                f"in the hub as RETAIL) and it will stop appearing."
+            )
+        findings.append({
+            "detector": "paid-invoice-unlinked",
+            "domain": "controls",
+            "severity": "warning",
+            "entity_code": entity,
+            "is_people_flag": False,
+            "title": title,
+            "detail": detail,
+            "amount": total,
+            "evidence": {
+                "dedupKey": f"paid-invoice-unlinked:{entity}:{subkind}:{norm_key}",
+                "kind": "paid-invoice-unlinked",
+                "subkind": subkind,
+                "xeroContactName": contact_name,
+                "knownHubSupplier": subkind == "hub-supplier-bypass",
+                "billCount": n,
+                "billTotal": total,
+                "bills": rows[-50:],
+            },
+        })
 
     # 5. Duplicate Xero bills across multiple tickets in this entity.
     #

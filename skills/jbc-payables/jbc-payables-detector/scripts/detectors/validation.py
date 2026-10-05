@@ -158,6 +158,11 @@ def _check_duplicates(entity: str, bills: list[dict[str, Any]]) -> list[dict[str
     # Index by ContactID
     by_supplier: dict[str, list[dict[str, Any]]] = {}
     for inv in bills:
+        # Voiding or deleting the copy is how a duplicate gets fixed; counting
+        # those kept fixed duplicates flagged for good. Drafts stay in — a
+        # draft copy of an approved bill is exactly what to catch.
+        if inv.get("Status") in ("VOIDED", "DELETED"):
+            continue
         cid = (inv.get("Contact") or {}).get("ContactID")
         if not cid:
             continue
@@ -219,6 +224,15 @@ def _check_duplicates(entity: str, bills: list[dict[str, Any]]) -> list[dict[str
                         "matchedOn": "invoice-number" if same_num else "amount-and-date",
                     })
             if not matches:
+                continue
+            # Flag the LATER copy only — the earliest bill in a matched set is
+            # the original. Previously both halves of every pair were flagged,
+            # so each duplicate showed up twice.
+            has_earlier_copy = any(
+                (m["date"], m["xeroInvoiceId"]) < (d_i.date().isoformat(), id_i)
+                for m in matches
+            )
+            if not has_earlier_copy:
                 continue
             if id_i in flagged:
                 continue

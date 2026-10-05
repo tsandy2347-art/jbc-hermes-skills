@@ -57,6 +57,9 @@ STATE_DETECTORS = [
     "payment-run-proposed",
     "new-supplier-quarantine",
     "new-supplier-detector-failed",
+    # Re-derived from every live bill in the window each run: clears when the
+    # copy is voided/deleted or the pair ages out of PAYABLES_LOOKBACK_DAYS.
+    "duplicate-invoice",
     # Detector-failure findings are state too: if the check runs clean
     # next time, the 'this is broken' finding must clear itself.
     "ingest-failure",
