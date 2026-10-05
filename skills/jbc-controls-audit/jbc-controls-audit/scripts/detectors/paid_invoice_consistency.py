@@ -28,6 +28,7 @@ import datetime as _dt
 import hashlib
 import json
 import os
+import re
 from typing import Any
 
 from .. import compliance_db as cdb
@@ -37,9 +38,9 @@ COMPLIANCE_CRITICAL_TYPES = {"PUBLIC_LIABILITY", "POLICE_CHECK"}
 
 # Overhead / non-participant vendors that legitimately never route through the
 # compliance hub. A paid Xero bill from one of these is expected to be
-# "unlinked" — we skip it rather than flag it. Matched as case-insensitive
-# substrings against the Xero contact name. Tune via AUDIT_PAID_INVOICE_ALLOWLIST
-# (comma-separated, appended to these defaults).
+# "unlinked" — we skip it rather than flag it. Matched case-insensitively as
+# WHOLE WORDS / phrases against the Xero contact name (see _allowlisted). Tune
+# via AUDIT_PAID_INVOICE_ALLOWLIST (comma-separated, appended to these defaults).
 DEFAULT_ALLOWLIST_KEYWORDS = (
     "payroll", "wages", "superannuation", "super fund", "ato",
     "australian taxation", "office of state revenue", "osr ",
@@ -59,6 +60,24 @@ def _allowlist() -> tuple[str, ...]:
         k.strip().lower() for k in extra.split(",") if k.strip()
     )
     return DEFAULT_ALLOWLIST_KEYWORDS + extras
+
+
+def _keyword_patterns(keywords: tuple[str, ...]) -> list[re.Pattern[str]]:
+    return [
+        re.compile(r"(?<![a-z0-9])" + re.escape(k.strip()) + r"(?![a-z0-9])")
+        for k in keywords
+        if k.strip()
+    ]
+
+
+def _allowlisted(contact_name: str | None, patterns: list[re.Pattern[str]]) -> bool:
+    """Whole-word match. Substring matching (until Oct 2026) skipped 21 real
+    suppliers that merely contained a keyword — "Maroochy Waters" physio
+    ("water"), "Brent of All Trades" ("rent"), "Taribelang Aboriginal
+    Corporation" ("origin"), "Shelley Lane" ("shell") — so they were never
+    checked for vetting at all."""
+    name = (contact_name or "").lower()
+    return any(p.search(name) for p in patterns)
 
 
 def _norm_supplier(name: str | None) -> str:
@@ -174,7 +193,7 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
         if s.entity_code == entity and s.name
     }
     known_supplier_names.discard("")
-    allowlist = _allowlist()
+    allowlist = _keyword_patterns(_allowlist())
     try:
         bills = list_bills(entity, from_iso=from_iso, to_iso=to_iso)
     except Exception as exc:  # noqa: BLE001
@@ -240,8 +259,7 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
 
             norm = _norm_supplier(contact_name)
             is_known = bool(norm) and norm in known_supplier_names
-            is_allowlisted = any(kw in (contact_name or "").lower()
-                                 for kw in allowlist)
+            is_allowlisted = _allowlisted(contact_name, allowlist)
 
             # Expected-direct overhead (payroll, ATO, rent, utilities, SaaS…) —
             # legitimately never routes through the hub. Skip unless it's a
