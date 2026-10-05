@@ -214,8 +214,10 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
         })
         return findings
 
-    # Unlinked bills are reported per supplier, not per bill (see below).
+    # Unlinked bills and compliance-lapsed invoices are reported per
+    # supplier, not per bill (see the emit sections below).
     unlinked: dict[tuple[str, str], dict[str, Any]] = {}
+    lapsed_by_supplier: dict[str, dict[str, Any]] = {}
 
     # ── per-bill checks ───────────────────────────────────────────
     for b in bills:
@@ -412,51 +414,74 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
                 if due < inv_date:
                     lapsed.append(r)
             if lapsed:
-                critical = any(r.type in COMPLIANCE_CRITICAL_TYPES for r in lapsed)
-                supplier = snap.suppliers.get(link.supplier_id)
-                supplier_name = supplier.name if supplier else (
-                    link.supplier_name_extracted or "(unknown)"
-                )
-                lapsed_list = ", ".join(
-                    f"{r.type} (due {r.date_due.date().isoformat()})" for r in lapsed
-                )
-                fp = _fingerprint(*(r.type for r in lapsed))
-                findings.append({
-                    "detector": "paid-invoice-compliance-lapsed",
-                    "domain": "controls",
-                    "severity": "critical" if critical else "warning",
-                    "entity_code": entity,
-                    "is_people_flag": False,
-                    "title": (
-                        f"{entity}: supplier compliance lapsed at invoice date "
-                        f"— {supplier_name}"
-                    ),
-                    "detail": (
-                        f"Supplier \"{supplier_name}\" had {len(lapsed)} "
-                        f"compliance item(s) expired on the invoice date "
-                        f"{link.invoice_date.date().isoformat()} when ticket "
-                        f"#{link.ticket_number} was processed "
-                        f"(${bill_total:.2f}). Lapsed: {lapsed_list}. "
-                        f"Confirm whether evidence existed offline."
-                    ),
-                    "amount": bill_total,
-                    "evidence": {
-                        "dedupKey": (
-                            f"paid-invoice-compliance-lapsed:{entity}:"
-                            f"{link.ticket_id}:{fp}"
-                        ),
-                        "kind": "paid-invoice-compliance-lapsed",
-                        "ticketId": link.ticket_id,
-                        "ticketNumber": link.ticket_number,
-                        "supplierId": link.supplier_id,
-                        "supplierName": supplier_name,
-                        "invoiceDate": link.invoice_date.isoformat(),
-                        "lapsed": [
-                            {"type": r.type, "dateDue": r.date_due.isoformat()}
-                            for r in lapsed
-                        ],
-                    },
+                g = lapsed_by_supplier.setdefault(link.supplier_id, {
+                    "fallbackName": link.supplier_name_extracted,
+                    "types": {},
+                    "invoices": [],
                 })
+                for r in lapsed:
+                    g["types"][r.type] = r.date_due
+                g["invoices"].append({
+                    "ticketId": link.ticket_id,
+                    "ticketNumber": link.ticket_number,
+                    "invoiceDate": link.invoice_date.isoformat(),
+                    "xeroBillId": bill_id,
+                    "billTotal": bill_total,
+                    "lapsedTypes": sorted(r.type for r in lapsed),
+                })
+
+    # 4 (emit). Compliance lapsed — ONE finding per supplier, not per invoice.
+    # Until Oct 2026 each invoice was its own line (28 for Colomba alone on
+    # 5 Oct). The check compares each invoice date with the supplier's CURRENT
+    # expiry dates in the hub, so a supplier that renews drops out on the next
+    # run; anything still listed is expired today, and is said so plainly.
+    for sid, g in lapsed_by_supplier.items():
+        supplier = snap.suppliers.get(sid)
+        supplier_name = supplier.name if supplier else (g["fallbackName"] or "(unknown)")
+        invoices = sorted(g["invoices"], key=lambda r: r["invoiceDate"])
+        n = len(invoices)
+        total = round(sum(r["billTotal"] for r in invoices), 2)
+        types = sorted(g["types"].items(), key=lambda kv: kv[1])
+        critical = any(t in COMPLIANCE_CRITICAL_TYPES for t, _ in types)
+        expired = ", ".join(
+            f"{t.replace('_', ' ').title()} (expired {d.date().isoformat()})" for t, d in types
+        )
+        first = invoices[0]["invoiceDate"][:10]
+        last = invoices[-1]["invoiceDate"][:10]
+        span = first if first == last else f"{first} to {last}"
+        findings.append({
+            "detector": "paid-invoice-compliance-lapsed",
+            "domain": "controls",
+            "severity": "critical" if critical else "warning",
+            "entity_code": entity,
+            "is_people_flag": False,
+            "title": (
+                f"{entity}: paying a supplier with expired compliance — "
+                f"{supplier_name}: {n} invoice{'s' if n != 1 else ''} "
+                f"(${total:,.0f}) after {expired}"
+            ),
+            "detail": (
+                f"{n} invoice(s) from \"{supplier_name}\" dated {span}, totalling "
+                f"${total:,.2f}, were processed after: {expired}. Still expired "
+                f"in the compliance hub today. Either get the renewed documents "
+                f"into the hub (this clears on the next run) or hold further "
+                f"payments. Tickets: "
+                + ", ".join(f"#{r['ticketNumber']}" for r in invoices[-20:])
+                + ("…" if n > 20 else "")
+                + "."
+            ),
+            "amount": total,
+            "evidence": {
+                "dedupKey": f"paid-invoice-compliance-lapsed:{entity}:{sid}",
+                "kind": "paid-invoice-compliance-lapsed",
+                "supplierId": sid,
+                "supplierName": supplier_name,
+                "invoiceCount": n,
+                "total": total,
+                "lapsed": [{"type": t, "dateDue": d.isoformat()} for t, d in types],
+                "invoices": invoices[-50:],
+            },
+        })
 
     # 6 (emit). Unlinked bills — ONE finding per supplier, not per bill.
     # Until Oct 2026 each bill was its own finding and none ever closed, so
