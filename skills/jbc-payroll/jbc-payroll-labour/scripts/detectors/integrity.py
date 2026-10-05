@@ -84,15 +84,29 @@ def detect_super_miscalc(lines: Iterable[Any],
 
 
 def detect_duplicate_payline(lines: Iterable[Any]) -> list[dict[str, Any]]:
-    """Same employee + lineType + amount appearing more than once in a run."""
-    counts: dict[tuple[str, str, str, str, float], int] = defaultdict(int)
-    sample: dict[tuple[str, str, str, str, float], Any] = {}
+    """Same employee + pay item + amount appearing more than once in a run.
+
+    Keyed on the MYOB pay item, not just the line category. Until Oct 2026 it
+    keyed on category ("wages & salaries") + amount, and every one of the 61
+    flags on 5 Oct was two DIFFERENT pay items that come to the same dollars
+    by award arithmetic — Ordinary Hours and Sunday Loading (100%), Saturday
+    Loading (50%) and Casual Loading (25%), a top-up and travel time.
+
+    Limitation: the MYOB Pay Activity export already sums each pay item per
+    employee per run, so a shift keyed twice shows up as one larger line, not
+    a repeat. This catches a pay item genuinely listed twice; it cannot see
+    double-keyed hours.
+    """
+    counts: dict[tuple[str, str, str, str, str, float], int] = defaultdict(int)
+    sample: dict[tuple[str, str, str, str, str, float], Any] = {}
     for ln in lines:
         # Aggregate control lines aren't duplicates.
         if ln.line_type in {"gross", "net-pay", "payg"}:
             continue
+        raw = getattr(ln, "raw", None) or {}
+        pay_item = str(raw.get("payitemid") or ln.classification or "")
         key = (ln.entity_code, ln.employee_id, ln.pay_run_id,
-               ln.line_type, round(float(ln.amount or 0.0), 2))
+               ln.line_type, pay_item, round(float(ln.amount or 0.0), 2))
         counts[key] += 1
         sample.setdefault(key, ln)
 
@@ -100,8 +114,9 @@ def detect_duplicate_payline(lines: Iterable[Any]) -> list[dict[str, Any]]:
     for key, n in counts.items():
         if n < 2:
             continue
-        entity, emp_id, run_id, line_type, amount = key
+        entity, emp_id, run_id, line_type, pay_item, amount = key
         ln = sample[key]
+        item_label = ln.classification or pay_item or line_type
         out.append({
             "detector": "duplicate-payline",
             "domain": "integrity",
@@ -109,23 +124,25 @@ def detect_duplicate_payline(lines: Iterable[Any]) -> list[dict[str, Any]]:
             "entity_code": entity,
             "is_people_flag": True,
             "title": (
-                f"Duplicate pay line × {n}: {ln.employee_name} {line_type} "
+                f"Duplicate pay line × {n}: {ln.employee_name} {item_label} "
                 f"A${amount:,.2f}"
             ),
             "detail": (
-                f"Pay line for {ln.employee_name} ({emp_id}) of type "
-                f"{line_type} A${amount:,.2f} appears {n} times in pay run "
+                f"Pay item {item_label} for {ln.employee_name} ({emp_id}) "
+                f"A${amount:,.2f} appears {n} times in pay run "
                 f"{run_id}. Likely double-keyed in MYOB."
             ),
             "amount": round(amount * (n - 1), 2),
             "evidence": {
                 "dedupKey": (
-                    f"duplicate-payline:{entity}:{emp_id}:{line_type}:"
+                    f"duplicate-payline:{entity}:{emp_id}:{pay_item}:"
                     f"{amount}:{run_id}"
                 ),
                 "entityCode": entity, "employeeId": emp_id,
                 "employeeName": ln.employee_name, "payRunId": run_id,
-                "lineType": line_type, "amount": amount, "occurrences": n,
+                "lineType": line_type, "payItem": pay_item,
+                "payItemName": ln.classification,
+                "amount": amount, "occurrences": n,
             },
         })
     return out
