@@ -174,11 +174,11 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
     cutoff = _cutoff_date()
     findings: list[dict[str, Any]] = []
 
-    # Bounded recent window. list_bills() now pulls newest-first and caps at
-    # 5000 rows; a tight window keeps every recent bill inside the cap (a
-    # 365-day window on a high-volume tenant pushed recent bills past the cap
-    # and the detector never saw them). 90 days covers normal supplier-pay
-    # cycles with headroom. Override via AUDIT_PAID_INVOICE_WINDOW_DAYS.
+    # Bounded recent window. list_bills() fetches it in date slices so the
+    # result is complete (SC has ~6,700 bills in 90 days, past Xero's 5,000
+    # per-request cap), and raises rather than return a short list — which
+    # the except below turns into a skipped-run finding that also stops the
+    # sweep. Override via AUDIT_PAID_INVOICE_WINDOW_DAYS.
     window_days = int(_env_float("AUDIT_PAID_INVOICE_WINDOW_DAYS", 90))
     today = _dt.date.today()
     from_iso = (today - _dt.timedelta(days=window_days)).isoformat()

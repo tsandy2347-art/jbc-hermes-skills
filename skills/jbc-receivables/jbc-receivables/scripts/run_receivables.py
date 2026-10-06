@@ -192,12 +192,14 @@ def _persist_finding(conn, Jsonb, run_id: str, f: dict[str, Any]) -> bool:
                 cur.execute(
                     """
                     UPDATE findings
-                       SET title=%s, detail=%s, amount=%s, evidence=%s, run_id=%s
+                       SET title=%s, detail=%s, amount=%s, evidence=%s, run_id=%s,
+                           severity=%s
                      WHERE id=%s
                     """,
                     (
                         f["title"], f["detail"], f.get("amount"),
-                        Jsonb(evidence), run_id, existing_id,
+                        Jsonb(evidence), run_id, f.get("severity", "warning"),
+                        existing_id,
                     ),
                 )
                 conn.commit()

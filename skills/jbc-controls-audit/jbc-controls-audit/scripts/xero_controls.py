@@ -114,28 +114,28 @@ def list_manual_journals(entity: str) -> list[dict[str, Any]]:
     return list(data.get("ManualJournals") or [])
 
 
-def list_bills(entity: str, *, from_iso: str | None = None,
-               to_iso: str | None = None) -> list[dict[str, Any]]:
-    """ACCPAY invoices (supplier bills), paginated.
+class BillFetchTruncated(RuntimeError):
+    """Xero's 5,000-row page cap was hit even on a single day of bills, so the
+    result would be incomplete. Raised rather than returned short: these
+    checks auto-close what they do not see, so a partial list must never pass
+    for a complete one."""
 
-    from_iso / to_iso constrain the bill Date. Strings of the form YYYY-MM-DD.
-    """
+
+_PAGE_CAP = 50  # Xero pages of 100 → 5,000 rows
+
+
+def _dt_clause(op: str, d: _dt.date) -> str:
+    return f"Date{op}DateTime({d.year},{d.month},{d.day})"
+
+
+def _bills_between(entity: str, lo: _dt.date | None, hi: _dt.date | None) -> tuple[list[dict[str, Any]], bool]:
+    """One date range, paged. Returns (rows, hit_cap)."""
     where_parts = ['Type=="ACCPAY"']
-    if from_iso:
-        y, m, d = from_iso[:4], from_iso[5:7], from_iso[8:10]
-        if y.isdigit() and m.isdigit() and d.isdigit():
-            where_parts.append(f"Date>=DateTime({int(y)},{int(m)},{int(d)})")
-    if to_iso:
-        y, m, d = to_iso[:4], to_iso[5:7], to_iso[8:10]
-        if y.isdigit() and m.isdigit() and d.isdigit():
-            where_parts.append(f"Date<=DateTime({int(y)},{int(m)},{int(d)})")
+    if lo:
+        where_parts.append(_dt_clause(">=", lo))
+    if hi:
+        where_parts.append(_dt_clause("<=", hi))
     where = " AND ".join(where_parts)
-
-    # Newest-first. The endpoint caps hard at 5000 rows (50 pages × 100);
-    # without an explicit order Xero returns oldest-first, so on a tenant
-    # with >5000 bills in the window the cap silently drops the most RECENT
-    # bills — exactly the ones a daily control must see. Date DESC guarantees
-    # recent coverage; pair with a bounded window in the caller.
     results: list[dict[str, Any]] = []
     page = 1
     while True:
@@ -143,14 +143,72 @@ def list_bills(entity: str, *, from_iso: str | None = None,
                     order="Date DESC")
         chunk = list(data.get("Invoices") or [])
         if not chunk:
-            break
+            return results, False
         results.extend(chunk)
         if len(chunk) < 100:
-            break
+            return results, False
         page += 1
-        if page > 50:
-            break
-    return results
+        if page > _PAGE_CAP:
+            return results, True
+
+
+def _parse_iso(value: str | None) -> _dt.date | None:
+    if not value:
+        return None
+    try:
+        return _dt.date.fromisoformat(value[:10])
+    except ValueError:
+        return None
+
+
+def list_bills(entity: str, *, from_iso: str | None = None,
+               to_iso: str | None = None, slice_days: int = 10) -> list[dict[str, Any]]:
+    """ACCPAY invoices (supplier bills) dated from_iso..to_iso, complete.
+
+    Fetched in date slices (default 10 days) so no request reaches Xero's
+    5,000-row cap; a slice that still does is halved until it fits. Until
+    Oct 2026 this was one capped request: SC carries ~6,700 bills in 90 days,
+    so a quarter were silently dropped every run (Colomba's 132 live bills
+    on 6 Oct among them). Raises BillFetchTruncated if one day exceeds the cap.
+    """
+    lo = _parse_iso(from_iso)
+    hi = _parse_iso(to_iso)
+    if lo is None:
+        rows, capped = _bills_between(entity, None, hi)
+        if capped:
+            raise BillFetchTruncated(f"{entity}: >5,000 bills with no start date — pass from_iso")
+        return rows
+
+    end = hi or _dt.date.today()
+    out: dict[str, dict[str, Any]] = {}
+
+    def fetch(a: _dt.date, b: _dt.date) -> None:
+        rows, capped = _bills_between(entity, a, b)
+        if capped:
+            if a >= b:
+                raise BillFetchTruncated(f"{entity}: more than 5,000 bills dated {a.isoformat()}")
+            mid = a + (b - a) // 2
+            fetch(a, mid)
+            fetch(mid + _dt.timedelta(days=1), b)
+            return
+        for r in rows:
+            if r.get("InvoiceID"):
+                out[r["InvoiceID"]] = r
+
+    cur = lo
+    while cur <= end:
+        stop = min(cur + _dt.timedelta(days=slice_days - 1), end)
+        fetch(cur, stop)
+        cur = stop + _dt.timedelta(days=1)
+    if hi is None:
+        # Open-ended: also take anything dated after today (future-dated bills).
+        rows, capped = _bills_between(entity, end + _dt.timedelta(days=1), None)
+        if capped:
+            raise BillFetchTruncated(f"{entity}: >5,000 future-dated bills")
+        for r in rows:
+            if r.get("InvoiceID"):
+                out[r["InvoiceID"]] = r
+    return sorted(out.values(), key=lambda r: str(r.get("DateString") or r.get("Date") or ""), reverse=True)
 
 
 def list_payments(entity: str) -> list[dict[str, Any]]:

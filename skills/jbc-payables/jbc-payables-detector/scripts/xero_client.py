@@ -103,25 +103,18 @@ def clear_snapshot_cache() -> None:
     _SNAPSHOT_CACHE.clear()
 
 
-def list_accpay_invoices(entity: str, *, since_iso: str) -> list[dict[str, Any]]:
-    """All ACCPAY (supplier bills) modified since `since_iso`. Paginated."""
-    cache_key = ("accpay", entity, since_iso)
-    cached = _SNAPSHOT_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
+class BillFetchTruncated(RuntimeError):
+    """A single day of bills exceeded Xero's 5,000-row page cap. Raised, never
+    returned short: payables detectors are swept, so a partial list would
+    close findings for bills that were simply not fetched."""
+
+
+def _accpay_between(entity: str, lo: _dt.date, hi: _dt.date | None) -> tuple[list[dict[str, Any]], bool]:
+    where = f'Type=="ACCPAY" AND Date >= DateTime({lo.year},{lo.month:02d},{lo.day:02d})'
+    if hi is not None:
+        where += f' AND Date <= DateTime({hi.year},{hi.month:02d},{hi.day:02d})'
     results: list[dict[str, Any]] = []
     page = 1
-    since_dt = _dt.datetime.fromisoformat(since_iso)
-    # Filter by date SERVER-side. This used to fetch every ACCPAY invoice ever
-    # raised and filter in Python, which was not just slow: paging stops at 50
-    # pages (5,000 invoices) and Xero returns oldest-first, so on a ledger
-    # larger than that the scan could run out of pages before reaching the
-    # recent bills it was actually looking for — a silent blind spot in the
-    # most recent data, which is the data that matters.
-    where = (
-        f'Type=="ACCPAY" AND Date >= DateTime({since_dt.year},'
-        f'{since_dt.month:02d},{since_dt.day:02d})'
-    )
     while True:
         # No try/except here on purpose. A failed page means we do not know
         # what is in Xero; the caller records that as an ingest-failure finding
@@ -129,13 +122,54 @@ def list_accpay_invoices(entity: str, *, since_iso: str) -> list[dict[str, Any]]
         data = _get(entity, "Invoices", params={"page": page}, where=where)
         chunk = list(data.get("Invoices") or [])
         if not chunk:
-            break
+            return results, False
         results.extend(chunk)
         if len(chunk) < 100:
-            break
+            return results, False
         page += 1
         if page > 50:
-            break
+            return results, True
+
+
+def list_accpay_invoices(entity: str, *, since_iso: str, slice_days: int = 10) -> list[dict[str, Any]]:
+    """All ACCPAY (supplier bills) dated since `since_iso`, complete.
+
+    Fetched in date slices so no request reaches Xero's 5,000-row cap (a
+    slice that does is halved until it fits). Until Oct 2026 this was one
+    capped request: SC has ~6,700 bills in 90 days, so ~1,700 were silently
+    missing from every payables run. Raises BillFetchTruncated if a single
+    day exceeds the cap.
+    """
+    cache_key = ("accpay", entity, since_iso)
+    cached = _SNAPSHOT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    lo = _dt.date.fromisoformat(since_iso[:10])
+    today = _dt.date.today()
+    out: dict[str, dict[str, Any]] = {}
+
+    def fetch(a: _dt.date, b: _dt.date | None) -> None:
+        rows, capped = _accpay_between(entity, a, b)
+        if capped:
+            if b is None or a >= b:
+                raise BillFetchTruncated(
+                    f"{entity}: more than 5,000 bills dated {a.isoformat()}"
+                    + ("" if b else " onwards")
+                )
+            mid = a + (b - a) // 2
+            fetch(a, mid)
+            fetch(mid + _dt.timedelta(days=1), b)
+            return
+        for r in rows:
+            out[r.get("InvoiceID") or id(r)] = r
+
+    cur = lo
+    while cur <= today:
+        stop = min(cur + _dt.timedelta(days=slice_days - 1), today)
+        fetch(cur, stop)
+        cur = stop + _dt.timedelta(days=1)
+    fetch(today + _dt.timedelta(days=1), None)  # future-dated bills
+    results = list(out.values())
     _SNAPSHOT_CACHE[cache_key] = results
     return results
 
