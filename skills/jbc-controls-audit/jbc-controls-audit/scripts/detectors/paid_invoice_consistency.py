@@ -321,11 +321,33 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
                 },
             })
 
-        # 2. Amount drift
+        # 2. Amount drift — the ticket's extracted total and the Xero bill
+        # disagree. Worded so it does not presume which side is wrong: on
+        # 7 Oct 2026 every large drift (Looney's Labour, 4 bills) was the
+        # invoice reader putting the pre-GST figure in "total" while Xero held
+        # the correct GST-inclusive amount. The ticket figures still matter —
+        # they feed the approval card and the AlayaCare markup — so the flag
+        # stays, but it names the likely cause instead of implying overpayment.
         if link.extracted_total is not None:
-            delta = abs(bill_total - float(link.extracted_total))
+            ext = float(link.extracted_total)
+            delta = abs(bill_total - ext)
             if delta > tolerance:
-                sev = "critical" if delta > max(50.0, bill_total * 0.05) else "warning"
+                gst_on_xero = ext > 0 and abs(bill_total - ext * 1.1) <= 0.05
+                gst_on_ticket = bill_total > 0 and abs(ext - bill_total * 1.1) <= 0.05
+                if gst_on_xero:
+                    cause = ("exactly 10% apart — the ticket probably recorded the "
+                             "pre-GST amount as the total")
+                    sev = "warning"
+                elif gst_on_ticket:
+                    cause = ("exactly 10% apart — the ticket includes GST the Xero "
+                             "bill does not; check whether the supplier charges GST")
+                    sev = "warning"
+                elif delta < 1.0:
+                    cause = "a rounding difference"
+                    sev = "info"
+                else:
+                    cause = "check the invoice to see which is right"
+                    sev = "critical" if delta > max(50.0, bill_total * 0.05) else "warning"
                 findings.append({
                     "detector": "paid-invoice-amount-drift",
                     "domain": "controls",
@@ -333,18 +355,21 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
                     "entity_code": entity,
                     "is_people_flag": False,
                     "title": (
-                        f"{entity}: amount drift — ticket #{link.ticket_number} "
-                        f"extracted ${link.extracted_total:.2f} vs Xero "
-                        f"${bill_total:.2f}"
+                        f"{entity}: ticket figures don't match the Xero bill — "
+                        f"#{link.ticket_number} ticket ${ext:,.2f} vs Xero "
+                        f"${bill_total:,.2f} ({cause})"
                     ),
                     "detail": (
-                        f"Invoice extracted from \"{contact_name}\" on ticket "
-                        f"#{link.ticket_number} totalled ${link.extracted_total:.2f}; "
-                        f"Xero bill {bill_number} is for ${bill_total:.2f} "
-                        f"(Δ ${delta:.2f}). Confirm whether the bill was "
-                        f"edited after creation."
+                        f"Ticket #{link.ticket_number} ({contact_name}) recorded "
+                        f"${ext:,.2f}; Xero bill {bill_number} is ${bill_total:,.2f} "
+                        f"(difference ${delta:,.2f}) — {cause}. Neither side is "
+                        f"assumed correct: check the invoice. If the ticket is "
+                        f"wrong, the approval card and any AlayaCare entry keyed "
+                        f"from it carry the wrong figure (the markup is calculated "
+                        f"from it); if Xero is wrong, correct the bill before "
+                        f"payment."
                     ),
-                    "amount": bill_total,
+                    "amount": round(delta, 2),
                     "evidence": {
                         "dedupKey": (
                             f"paid-invoice-amount-drift:{entity}:"
@@ -362,6 +387,11 @@ def run_paid_invoice_consistency(entity: str) -> list[dict[str, Any]]:
                         "extractedTotal": link.extracted_total,
                         "xeroTotal": bill_total,
                         "delta": round(delta, 2),
+                        "likelyCause": (
+                            "ticket-ex-gst" if gst_on_xero else
+                            "ticket-has-gst" if gst_on_ticket else
+                            "rounding" if delta < 1.0 else "unknown"
+                        ),
                     },
                 })
 
